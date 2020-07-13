@@ -80,3 +80,20 @@ class AutoregressiveModel(nn.Module):
                         record[l+1, :, i] = layer(record[l, :, i])
                 record[0, :, i] = dist.Bernoulli(record[-1, :, i]).sample()
         return record[0]
+    
+    def rsample(self, batch_size=1, tau=1, hard=False):
+        # create a record to host layerwise outputs
+        record = torch.zeros(len(self.layers)+1, batch_size, self.features)
+        # autoregressive batch sampling
+        for i in range(self.features):
+            for l, layer in enumerate(self.layers):
+                if isinstance(layer, AutoregressiveLinear): # linear layer
+                    record[l+1, :, i] = layer.forward_at(record[l], i)
+                else: # elementwise layer
+                    record[l+1, :, i] = layer(record[l, :, i])
+            record[0, :, i] = dist.Bernoulli(record[-1, :, i]).sample()
+            #prob = record[-1, :, i]
+            #logits = torch.stack([prob, 1.-prob], dim=-1).log()
+            #print(F.gumbel_softmax(logits, tau, hard))
+            #record[0, :, i] = F.gumbel_softmax(logits, tau, hard)
+        return record[0]
