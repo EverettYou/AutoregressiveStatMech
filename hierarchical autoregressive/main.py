@@ -9,25 +9,24 @@ from auto import *
 from flow import *
 
 
-class HolographicPixelFlow(nn.Module, dist.TransformedDistribution):
+class HpGCN(nn.Module, dist.TransformedDistribution):
     """ Combination of hierarchical autoregressive and flow-based model for lattice models.
     
         Args:
-        model: a energy model to learn
+        energy: a energy model to learn
         hidden_features: a list of feature dimensions of hidden layers
         nonlinearity: activation function to use 
         bias: whether to learn the additive bias in heap linear layers
     """
-    def __init__(self, model: EnergyModel, hidden_features, nonlinearity: str = 'ReLU', bias: bool = True):
-        super(HolographicPixelFlow, self).__init__()
-        self.model = model
-        self.haar = HaarTransform(model.lattice)
-        n = model.lattice.group.order
-        self.onecat = OneHotCategoricalTransform(n)
-        features = [n] + hidden_features + [n]
-        auto = AutoregressiveModel(model.lattice.units, features, nonlinearity, bias)
+    def __init__(self, energy: EnergyModel, edge_features: int, hidden_node_features,
+                nonlinearity: str = 'ReLU', bias: bool = True):
+        super(HpGCN, self).__init__()
+        self.energy = energy
+        self.group = energy.group
+        self.lattice = energy.lattice
+        self.haar = HaarTransform(self.group, self.lattice)
+        self.onecat = OneHotCategoricalTransform(self.group.order)
+        node_features = [self.group.order] + hidden_node_features + [self.group.order]
+        auto = AutoregressiveModel(self.lattice, edge_features, node_features, nonlinearity, bias)
         dist.TransformedDistribution.__init__(self, auto, [self.onecat, self.haar])
         self.transform = dist.ComposeTransform(self.transforms)
-        
-    def energy(self, input): # create a shortcut for energy
-        return self.model.energy(input)
