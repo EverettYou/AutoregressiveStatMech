@@ -9710,10 +9710,3 @@ Cell[CellGroupData[{
 Cell[407060, 9444, 1479, 42, 108, "Input",ExpressionUUID->"c0e05bb2-5b89-4513-88d6-c90e80fd905b"],
 Cell[408542, 9488, 2741, 66, 312, "Print",ExpressionUUID->"ededde60-e96a-40e1-a169-02ff7b9de11f"],
 Cell[411286, 9556, 1148, 19, 100, "Output",ExpressionUUID->"2bf27185-d8f3-4ef6-8a60-f7ebbc11108c"]
-}, Open  ]]
-}, Closed]]
-}, Open  ]]
-}
-]
-*)
-
