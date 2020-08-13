@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
-from torch_geometric.nn import MessagePassing
+import torch_scatter
 
 """ -------- Infrastructures -------- """
 
@@ -81,6 +81,9 @@ class Lattice(object):
             # (a) trucate to lower triangle to preserve the causal ordering
             # (b) clamping all elements to 0, 1
             return torch.tril(adj, -1).clamp(0, 1)
+        def make_edge_type(edge_index, typ):
+            # contrust constant array of typ, matching size(-1) of edge_index
+            return edge_index.new_full((1, edge_index.size(-1)), typ)
         # get direct causal connections
         level_graded_result = [discover_causal_connection(z) for z in range(1, self.tree_depth-1)]
         edge_index = torch.stack([torch.cat(tens, 0) for tens in zip(*level_graded_result)])
@@ -93,14 +96,11 @@ class Lattice(object):
         adj22 = re_adj(adj2 @ adj2.t() + adj11) - adj11 # cousin
         adj21 = re_adj(adj2 @ adj1.t() + adj1) - adj1 # niephew
         # collect causal relations by types
-        adjs = {'self': adj0, # adjs must at least have 'self' key
-                'child': adj1, 
-                'sibling': adj11, 
-                'niephew': adj21, 
-                'cousin': adj22, 
-                'grandchild': adj2}
+        adjs = [adj0, adj1, adj11, adj21, adj22, adj2]
         # convert to edge_index for return
-        return {typ: to_edge_index(adjs[typ]) for typ in adjs}
+        edge_index_list = [to_edge_index(adj) for adj in adjs]
+        edge_type_list = [make_edge_type(edge_index, typ) for typ, edge_index in enumerate(edge_index_list)]
+        return torch.cat([torch.cat(edge_index_list, -1), torch.cat(edge_type_list, -1)], 0)
 
     def node_position_encoding(self):
         """ Construct position encoding of all nodes """
@@ -399,62 +399,101 @@ class OneHotCategoricalTransform(dist.Transform):
 
 """ -------- Base Distribution -------- """
 
-class GraphConv(MessagePassing):
+class GraphConv(nn.Module):
     """ Graph Convolution layer 
         
         Args:
-        causal_graph: a dictionary of edges grouped by types
+        graph: tensor of shape [3, num_edges] 
+               specifying (source, target, type) along each column
         in_features: number of input features (per node)
         out_features: number of output features (per node)
         bias: whether to learn an edge-depenent bias
         self_loop: whether to include self loops in message passing
     """
-    def __init__(self, causal_graph: dict, in_features: int, out_features: int,
+    def __init__(self, graph: torch.Tensor, in_features: int, out_features: int,
                  bias: bool = True, self_loop: bool = True):
-        super(GraphConv, self).__init__(aggr='add')
-        self.causal_graph = causal_graph.copy() # without copying, update_causal_graph will interfere with each other
+        super(GraphConv, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.bias = bias
-        self.linears = nn.ModuleDict()
-        for typ in self.causal_graph:
-            self.linears[typ] = nn.Linear(self.in_features, self.out_features, self.bias)
+        if bias:
+            self.bias = bias
+        else:
+            self.register_parameter('bias', None)
+        self.edge_types = None
+        self.update_graph(graph)
         self.self_loop = self_loop
+
+    def update_graph(self, graph):
+        # update the graph, adding new linear maps if needed
+        self.graph = graph
+        edge_types = graph[-1].max() + 1
+        if edge_types != self.edge_types:
+            self.weight = nn.Parameter(torch.Tensor(edge_types, self.out_features, self.in_features))
+            if self.bias is not None:
+                self.bias = nn.Parameter(torch.Tensor(edge_types, self.out_features))
+            self.reset_parameters()
+        self.edge_types = edge_types
+        return self
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
     
     def extra_repr(self):
-        return '(self_loop): {}'.format(self.self_loop)
+        return 'edge_types={}, in_features={}, out_features={}, bias={}, self_loop={}'.format(
+            self.edge_types, self.in_features, self.out_features, self.bias is not None, self.self_loop)
 
     def forward(self, input, j = None):
-        # input: shape [..., N, in_features]
         # forward from a source node, indexed by j
         # if j is None, forward all nodes
-        output = None
-        for typ in self.causal_graph:
-            if typ is 'self' and not self.self_loop:
-                continue # skip 'self' if no self loop
-            edge_index = self.causal_graph[typ]
-            if j is not None:
-                mask = (edge_index[0] == j) # create a mask for edges
-                edge_index = edge_index[:, mask]
-            typ_output = self.propagate(edge_index, input=input, typ=typ)
-            if output is None:
-                output = typ_output
-            else:
-                output += typ_output
+        if j is None: # forward all nodes together
+            if self.self_loop: # if self loop allowed
+                typ0 = 0 # typ starts from 0
+            else: # if self loop forbidden
+                typ0 = 1 # typ starts from 1
+            output = None
+            for typ in range(typ0, self.edge_types):
+                mask = (self.graph[2] == typ)
+                if output is None:
+                    output = self.homo_propagate(self.graph[:2, mask], input, typ)
+                else:
+                    output += self.homo_propagate(self.graph[:2, mask], input, typ)
+        else: # forward from specific node
+            graph = self.graph
+            mask = (graph[0] == j) # mask out edges from other nodes
+            graph = graph[:, mask]
+            if not self.self_loop: # no self loop
+                mask = (graph[2] != 0) # mask out self loops
+                graph = graph[:, mask]
+            output = self.hetero_propagate(graph, input)
         return output
-    
-    def message(self, input_j, typ):
-        # x_j: shape [..., E, in_features]
-        return self.linears[typ](input_j)
 
-    def update_causal_graph(self, causal_graph: dict):
-        # update causal graph, adding new linear maps if needed
-        for typ in causal_graph:
-            if typ not in self.causal_graph: #typ is new
-                # create a new linear map for it
-                self.linears[typ] = nn.Linear(self.in_features, self.out_features, self.bias)
-        self.causal_graph.update(causal_graph)
-        return self
+    def homo_propagate(self, graph, input, typ):
+        [source, target] = graph
+        signal = input[..., source, :] # shape [..., E, in_features]
+        if self.bias is None:
+            message = F.linear(signal, self.weight[typ]) # shape: [..., E, out_features]
+        else:
+            message = F.linear(signal, self.weight[typ], self.bias[typ]) # shape: [..., E, out_features]
+        output = torch_scatter.scatter_add(message, target,
+                    dim = -2, dim_size = input.size(-2))
+        return output # shape: [..., N, out_features]
+
+    def hetero_propagate(self, graph, input):
+        # input: shape [..., N, in_features]
+        [source, target, edge_type] = graph
+        signal = input[..., source, :] # shape [..., E, in_features]
+        weight = self.weight[edge_type] # shape [E, out_features, in_features]
+        message = torch.sum(weight * signal.unsqueeze(-2), -1) # shape [..., E, out_features]
+        if self.bias is not None:
+            bias = self.bias[edge_type] # shape [E, out_features]
+            message += bias
+        output = torch_scatter.scatter_add(message, target,
+                    dim = -2, dim_size = input.size(-2))
+        return output # shape: [..., N, out_features]
 
 class AutoregressiveModel(nn.Module, dist.Distribution):
     """ Represent a generative model that can generate samples and evaluate log probabilities.
@@ -473,31 +512,37 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         self.features = features
         dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.features[0]]))
         self.has_rsample = True
-        causal_graph = self.lattice.causal_graph()
+        self.graph = self.lattice.causal_graph()
         self.layers = nn.ModuleList()
         for l in range(1, len(self.features)):
             if l == 1: # the first layer should not have self loops
-                self.layers.append(GraphConv(causal_graph, 
-                    self.features[0], self.features[1], bias, self_loop = False))
+                self.layers.append(GraphConv(self.graph, self.features[0], self.features[1], bias, self_loop = False))
             else: # remaining layers are normal
                 self.layers.append(nn.LayerNorm([self.features[l - 1]]))
                 self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
-                self.layers.append(GraphConv(causal_graph,
-                    self.features[l - 1], self.features[l], bias))
-    
+                self.layers.append(GraphConv(self.graph, self.features[l - 1], self.features[l], bias))
+
+    def update_graph(self, graph):
+        # update graph for all GraphConv layers
+        self.graph = graph
+        for layer in self.layers:
+            if isinstance(layer, GraphConv):
+                layer.update_graph(graph)
+        return self
+
     def forward(self, input):
         output = input
         for layer in self.layers: # apply layers
             output = layer(output)
         return output # logits
     
-    def log_prob(self, value):
-        logits = self(value) # forward pass to get logits
-        return torch.sum(value * F.log_softmax(logits, dim=-1), (-2,-1))
+    def log_prob(self, sample):
+        logits = self(sample) # forward pass to get logits
+        return torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
 
     def sampler(self, logits, dim=-1): # simplified from F.gumbel_softmax
         gumbels = -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        gumbels += logits
+        gumbels += logits.detach()
         index = gumbels.max(dim, keepdim=True)[1]
         return torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
 
@@ -522,7 +567,9 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
                     else: # remaining layers forward from this node
                         cache[l + 1] += layer(cache[l], j)
                 else: # for other layers, only update node j (other nodes not ready yet)
-                    cache[l + 1][..., j, :] = layer(cache[l][..., j, :])
+                    src = layer(cache[l][..., [j], :])
+                    index = torch.tensor(j).view([1]*src.dim()).expand(src.size())
+                    cache[l + 1] = cache[l + 1].scatter(-2, index, src)
             # the last cache hosts the logit, sample from it 
             cache[0][..., j, :] = sampler(cache[-1][..., j, :])
         return cache # cache[0] hosts the sample
@@ -539,12 +586,13 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         cache = self._sample(sample_size, lambda x: F.gumbel_softmax(x, tau, hard))
         return cache[0]
 
-    def update_causal_graph(self, causal_graph: dict):
-        # update causal graph for all GraphConv layers
-        for layer in self.layers:
-            if isinstance(layer, GraphConv):
-                layer.update_causal_graph(causal_graph)
-        return self
+    def sample_with_log_prob(self, sample_size=1):
+        cache = self._sample(sample_size)
+        sample = cache[0]
+        logits = cache[-1]
+        log_prob = torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
+        return sample, log_prob
+
 
 """ -------- Model Interface -------- """
 
