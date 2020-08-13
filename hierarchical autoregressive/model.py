@@ -51,9 +51,9 @@ class Lattice(object):
                 self.node_index[ind-self.sites] = rng[:,0].dot(self.size**torch.arange(0,self.dimension).flip(0))
         partition(torch.tensor([[0, self.size]]*self.dimension), 0, 1, 1)
         
-    def causal_graph(self, causal_radius: float = 1.):
+    def causal_graph(self, speed_of_light: float = 1.):
         """ Construct causal graph 
-            Args: causal_radius - radius of causal cone across one layer
+            Args: speed_of_light - speed of causal cone expansion across one layer
             Returns causal edges, group by their types of causal relations
             in the form of a dictionary
         """
@@ -61,11 +61,11 @@ class Lattice(object):
             # Args: z - level of the source
             source_pos = self.node_centers[2**(z-1):2**z]
             target_pos = self.node_centers[2**z:2**(z+1)]
-            diff = source_pos.unsqueeze(0) - target_pos.unsqueeze(1) # difference 
-            diff = (diff + self.size/2)%self.size - self.size/2 # assuming periodic boundary
-            dist = torch.norm(diff, dim=-1) # distance
-            smooth_scale = 2**((self.tree_depth-1-z)/self.dimension)
-            mask = dist < causal_radius * smooth_scale
+            displacement = source_pos.unsqueeze(0) - target_pos.unsqueeze(1) # displacement between source and target 
+            displacement = (displacement + self.size/2)%self.size - self.size/2 # assuming periodic boundary
+            distance = torch.norm(displacement, dim=-1) # distance
+            time_scale = 2**((self.tree_depth-1-z)/self.dimension)
+            mask = distance < speed_of_light * time_scale
             target_ids, source_ids = torch.nonzero(mask, as_tuple=True)
             return (2**(z-1) + source_ids, 2**z + target_ids)
         def to_adj(edge_index):
@@ -93,9 +93,14 @@ class Lattice(object):
         adj22 = re_adj(adj2 @ adj2.t() + adj11) - adj11 # cousin
         adj21 = re_adj(adj2 @ adj1.t() + adj1) - adj1 # niephew
         # collect causal relations by types
-        adjs = {0: adj0, 1: adj1, 2: adj11, 3: adj21, 4: adj22, 5: adj2}
+        adjs = {'self': adj0, # adjs must at least have 'self' key
+                'child': adj1, 
+                'sibling': adj11, 
+                'niephew': adj21, 
+                'cousin': adj22, 
+                'grandchild': adj2}
         # convert to edge_index for return
-        return {k: to_edge_index(adjs[k]) for k in adjs}
+        return {typ: to_edge_index(adjs[typ]) for typ in adjs}
 
     def node_position_encoding(self):
         """ Construct position encoding of all nodes """
@@ -315,7 +320,7 @@ class EnergyModel(nn.Module):
         self.update(energy)
     
     def extra_repr(self):
-        return '(lattice): {}'.format(self.lattice) + super(EnergyModel, self).extra_repr()
+        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(EnergyModel, self).extra_repr()
         
     def forward(self, input):
         return self.energy(input)
@@ -407,41 +412,49 @@ class GraphConv(MessagePassing):
     def __init__(self, causal_graph: dict, in_features: int, out_features: int,
                  bias: bool = True, self_loop: bool = True):
         super(GraphConv, self).__init__(aggr='add')
-        self.causal_graph = causal_graph
+        self.causal_graph = causal_graph.copy() # without copying, update_causal_graph will interfere with each other
         self.in_features = in_features
         self.out_features = out_features
-        self.linears = nn.ModuleList()
-        for k in self.causal_graph:
-            self.linears.append(nn.Linear(in_features, out_features, bias))
+        self.bias = bias
+        self.linears = nn.ModuleDict()
+        for typ in self.causal_graph:
+            self.linears[typ] = nn.Linear(self.in_features, self.out_features, self.bias)
         self.self_loop = self_loop
     
     def extra_repr(self):
         return '(self_loop): {}'.format(self.self_loop)
 
-    def forward(self, input):
+    def forward(self, input, j = None):
         # input: shape [..., N, in_features]
-        output = []
-        for k in self.causal_graph:
-            if k == 0 and not self.self_loop:
-                continue # skip k = 0 if no self loop
-            edge_index = self.causal_graph[k]
-            output.append(self.propagate(edge_index, input=input, k=k))
-        return sum(output)
-    
-    def forward_from(self, input, j):
         # forward from a source node, indexed by j
-        output = []
-        for k in self.causal_graph:
-            if k == 0 and not self.self_loop:
-                continue # skip k = 0 if no self loop
-            edge_index = self.causal_graph[k]
-            mask = (edge_index[0] == j) # create a mask for edges
-            output.append(self.propagate(edge_index[:, mask], input=input, k=k))
-        return sum(output)
+        # if j is None, forward all nodes
+        output = None
+        for typ in self.causal_graph:
+            if typ is 'self' and not self.self_loop:
+                continue # skip 'self' if no self loop
+            edge_index = self.causal_graph[typ]
+            if j is not None:
+                mask = (edge_index[0] == j) # create a mask for edges
+                edge_index = edge_index[:, mask]
+            typ_output = self.propagate(edge_index, input=input, typ=typ)
+            if output is None:
+                output = typ_output
+            else:
+                output += typ_output
+        return output
     
-    def message(self, input_j, k):
+    def message(self, input_j, typ):
         # x_j: shape [..., E, in_features]
-        return self.linears[k](input_j)
+        return self.linears[typ](input_j)
+
+    def update_causal_graph(self, causal_graph: dict):
+        # update causal graph, adding new linear maps if needed
+        for typ in causal_graph:
+            if typ not in self.causal_graph: #typ is new
+                # create a new linear map for it
+                self.linears[typ] = nn.Linear(self.in_features, self.out_features, self.bias)
+        self.causal_graph.update(causal_graph)
+        return self
 
 class AutoregressiveModel(nn.Module, dist.Distribution):
     """ Represent a generative model that can generate samples and evaluate log probabilities.
@@ -457,21 +470,21 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         super(AutoregressiveModel, self).__init__()
         self.lattice = lattice
         self.nodes = lattice.sites
-        self.causal_graph = self.lattice.causal_graph()
         self.features = features
+        dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.features[0]]))
+        self.has_rsample = True
+        causal_graph = self.lattice.causal_graph()
         self.layers = nn.ModuleList()
         for l in range(1, len(self.features)):
             if l == 1: # the first layer should not have self loops
-                self.layers.append(GraphConv(self.causal_graph, 
+                self.layers.append(GraphConv(causal_graph, 
                     self.features[0], self.features[1], bias, self_loop = False))
             else: # remaining layers are normal
                 self.layers.append(nn.LayerNorm([self.features[l - 1]]))
                 self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
-                self.layers.append(GraphConv(self.causal_graph,
+                self.layers.append(GraphConv(causal_graph,
                     self.features[l - 1], self.features[l], bias))
-        dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.features[0]]))
-        self.has_rsample = True
-                
+    
     def forward(self, input):
         output = input
         for layer in self.layers: # apply layers
@@ -489,25 +502,26 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         return torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
 
     def _sample(self, sample_size: int, sampler = None):
-        if sampler is None: # if no sampler, use default
+        if sampler is None: # if no sampler specified, use default
             sampler = self.sampler
         # create a list of tensors to cache layer-wise outputs
         cache = [torch.zeros(sample_size, self.nodes, self.features[0])]
-        for l, layer in enumerate(self.layers):
+        for layer in self.layers:
             if isinstance(layer, GraphConv): # for graph convolution layers
-                features = layer.out_features
-                cache.append(torch.zeros(sample_size, self.nodes, features))
-            else: # other shape-preserving layers
-                cache.append(torch.zeros(sample_size, self.nodes, features))
-        cache[0][..., 0, :] = sampler(cache[0][..., 0, :]) # always sample node 0 uniformly
-        for j in range(1, self.nodes):
+                features = layer.out_features # features get updated
+            cache.append(torch.zeros(sample_size, self.nodes, features))
+        # cache established. start by sampling node 0.
+        # assuming global symmetry, node 0 is always sampled uniformly
+        cache[0][..., 0, :] = sampler(cache[0][..., 0, :])
+        # start autoregressive sampling
+        for j in range(1, self.nodes): # iterate through nodes 1:all
             for l, layer in enumerate(self.layers):
                 if isinstance(layer, GraphConv): # for graph convolution layers
                     if l==0: # first layer should forward from previous node
-                        cache[l + 1] += layer.forward_from(cache[l], j - 1)
+                        cache[l + 1] += layer(cache[l], j - 1)
                     else: # remaining layers forward from this node
-                        cache[l + 1] += layer.forward_from(cache[l], j)
-                else: # for other layers
+                        cache[l + 1] += layer(cache[l], j)
+                else: # for other layers, only update node j (other nodes not ready yet)
                     cache[l + 1][..., j, :] = layer(cache[l][..., j, :])
             # the last cache hosts the logit, sample from it 
             cache[0][..., j, :] = sampler(cache[-1][..., j, :])
@@ -519,10 +533,18 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         return cache[0]
     
     def rsample(self, sample_size=1, tau=None, hard=False):
+        # reparametrized Gumbel sampling
         if tau is None: # if temperature not given
             tau = 1/(self.features[-1]-1) # set by the out feature dimension
         cache = self._sample(sample_size, lambda x: F.gumbel_softmax(x, tau, hard))
         return cache[0]
+
+    def update_causal_graph(self, causal_graph: dict):
+        # update causal graph for all GraphConv layers
+        for layer in self.layers:
+            if isinstance(layer, GraphConv):
+                layer.update_causal_graph(causal_graph)
+        return self
 
 """ -------- Model Interface -------- """
 
