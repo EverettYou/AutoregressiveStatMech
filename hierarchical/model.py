@@ -33,13 +33,13 @@ class Lattice(object):
         """ Node initialization, calculate basic node information
             for other methods in this class to work.
             Called by class initialization. """
-        self.node_levels = torch.zeros(self.sites, dtype=torch.int)
-        self.node_centers = torch.zeros(self.sites, self.dimension, dtype=torch.float)
+        #self.node_levels = torch.zeros(self.sites, dtype=torch.int)
+        #self.node_centers = torch.zeros(self.sites, self.dimension, dtype=torch.float)
         self.node_index = torch.zeros(self.sites, dtype=torch.long)
         def partition(rng: torch.Tensor, dim: int, ind: int, lev: int):
             if rng[dim].sum()%2 == 0:
-                self.node_levels[ind] = lev
-                self.node_centers[ind] = rng.to(dtype=torch.float).mean(-1)
+                #self.node_levels[ind] = lev
+                #self.node_centers[ind] = rng.to(dtype=torch.float).mean(-1)
                 mid = rng[dim].sum()//2
                 rng1 = rng.clone()
                 rng1[dim, 1] = mid
@@ -50,64 +50,37 @@ class Lattice(object):
             else:
                 self.node_index[ind-self.sites] = rng[:,0].dot(self.size**torch.arange(0,self.dimension).flip(0))
         partition(torch.tensor([[0, self.size]]*self.dimension), 0, 1, 1)
-        
-    def causal_graph(self, speed_of_light: float = 1.):
+    
+    def causal_graph(self, k = 3):
         """ Construct causal graph 
-            Args: speed_of_light - speed of causal cone expansion across one layer
-            Returns causal edges, group by their types of causal relations
-            in the form of a dictionary
+            Args: k - number of generations to consider
         """
-        def discover_causal_connection(z: int):
-            # Args: z - level of the source
-            source_pos = self.node_centers[2**(z-1):2**z]
-            target_pos = self.node_centers[2**z:2**(z+1)]
-            displacement = source_pos.unsqueeze(0) - target_pos.unsqueeze(1) # displacement between source and target 
-            displacement = (displacement + self.size/2)%self.size - self.size/2 # assuming periodic boundary
-            distance = torch.norm(displacement, dim=-1) # distance
-            time_scale = 2**((self.tree_depth-1-z)/self.dimension)
-            mask = distance < speed_of_light * time_scale
-            target_ids, source_ids = torch.nonzero(mask, as_tuple=True)
-            return (2**(z-1) + source_ids, 2**z + target_ids)
-        def to_adj(edge_index):
-            # edge index -> adjecency matrix
-            ones = torch.ones(edge_index.size(-1), dtype=torch.long)
-            return torch.sparse.LongTensor(edge_index.flip(0), ones, torch.Size([self.sites]*2)).to_dense()
-        def to_edge_index(adj):
-            # adjacency matrix -> edge index
-            target, source = torch.nonzero(adj, as_tuple=True)
-            return torch.stack([source, target])
-        def re_adj(adj):
-            # rectify adjacency matrix:
-            # (a) trucate to lower triangle to preserve the causal ordering
-            # (b) clamping all elements to 0, 1
-            return torch.tril(adj, -1).clamp(0, 1)
-        def make_edge_type(edge_index, typ):
-            # contrust constant array of typ, matching size(-1) of edge_index
-            return edge_index.new_full((1, edge_index.size(-1)), typ)
-        # get direct causal connections
-        level_graded_result = [discover_causal_connection(z) for z in range(1, self.tree_depth-1)]
-        edge_index = torch.stack([torch.cat(tens, 0) for tens in zip(*level_graded_result)])
-        # develop derived causal connections
-        adj0 = to_adj(torch.stack([torch.arange(1, self.sites)]*2)) # self (excluding node 0)
-        adj1 = to_adj(edge_index) # child
-        adj2 = adj1 @ adj1 # grandchild
-        #adj3 = adj2 @ adj1 # grandgrandchild
-        adj11 = re_adj(adj1 @ adj1.t()) # sibling
-        adj22 = re_adj(adj2 @ adj2.t() + adj11) - adj11 # cousin
-        adj21 = re_adj(adj2 @ adj1.t() + adj1) - adj1 # niephew
-        # collect causal relations by types
-        adjs = [adj0, adj1, adj11, adj21, adj22, adj2]
-        # convert to edge_index for return
-        edge_index_list = [to_edge_index(adj) for adj in adjs]
-        edge_type_list = [make_edge_type(edge_index, typ) for typ, edge_index in enumerate(edge_index_list)]
-        return torch.cat([torch.cat(edge_index_list, -1), torch.cat(edge_type_list, -1)], 0)
-
-    def node_position_encoding(self):
-        """ Construct position encoding of all nodes """
-        phase = 2*math.pi*self.node_centers/self.size
-        levels = self.node_levels.to(dtype=torch.float).unsqueeze(-1)
-        encoding = torch.cat([phase.sin(), phase.cos(), levels], -1)
-        return encoding
+        self.family = {} # a dict hosting all relatives
+        def child(i, k): # kth-generation child of node i
+            return set(2**k * i + q for q in range(2**k))
+        def relative(k0, k1): # (k0, k1)-relatives
+            # two nodes i0 and i1 are (k0, k1)-relative,
+            # if their closest common ancestor is k0 and k1 generations from them respectively
+            if (k0, k1) not in self.family: # if relation not found
+                rels = set() # start collecting relative relations
+                for i in range(1, self.sites//2**max(k0, k1)): # for every possible common ancestor
+                    ch0 = child(i, k0) # set of k0-child
+                    ch1 = child(i, k1) # set of k1-child
+                    rels |= set((i0, i1) for i0 in ch0 for i1 in ch1 if i0 <= i1)
+                for k in range(min(k0, k1)): # exlusing closer relatives
+                    rels -= relative(k0 - k - 1, k1 - k - 1)
+                self.family[(k0, k1)] = rels # record the relations
+            return self.family[(k0, k1)]
+        # collect all relatives within k generations
+        typ = 0
+        gen = {}
+        for k1 in range(0, k):
+            for k0  in range(0, k1 + 1):
+                gen[typ] = relative(k0, k1)
+                typ += 1
+        index_list = [torch.tensor(sorted(list(gen[typ]))).t() for typ in gen]
+        type_list = [torch.Tensor().new_full((1, len(gen[typ])), typ, dtype=torch.long) for typ in gen]
+        return torch.cat([torch.cat(index_list, -1), torch.cat(type_list, -1)], 0)
 
 class Group(object):
     """Represent a group, providing multiplication and inverse operation.
