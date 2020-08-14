@@ -12,7 +12,7 @@ The model consists of the following parts:
 <img src="./hierarchical/image/model.png" alt="model" width="360"/>
 
 * A generative model p(x) consist of
-  * A base model p(z) realized as an **autoregressive model**, which uses graph convolutional network techniques to compute conditional distributions on a directed causal graph.
+  * A base model p(z) realized as an **autoregressive model**, which uses **graph convolutional network** (GCN) techniques to compute conditional distributions on a directed causal graph.
   * A stack of transformations containing
      * A **bijective encoding** (beetween one-hot and categorical)
      * A **renormalization group (RG) transformation** realized as a flow model (but currently fixed to be Haar wavelet transformation in this project).
