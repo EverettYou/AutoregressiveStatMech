@@ -15,7 +15,7 @@ else:
 H = lambda J: -J*(model.TwoBody(torch.tensor([1.,-1.]), (1,0))
                 + model.TwoBody(torch.tensor([1.,-1.]), (0,1)))
 hpGNN = model.HolographicPixelGNN(
-            model.EnergyModel(
+            model.Energy(
                 H(0.440686793), # Ising critical point
                 model.SymmetricGroup(2), 
                 model.Lattice(4, 2)), 
