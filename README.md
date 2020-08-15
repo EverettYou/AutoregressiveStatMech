@@ -9,7 +9,7 @@ Generative models have been applied to solve Statistical Mechanics problems by l
 ## Architecture Overview
 The model consists of the following parts:
 
-<img src=".notebooks/hierarchical/image/model.png" alt="model" width="360"/>
+<img src="./notebooks/hierarchical/image/model.png" alt="model" width="360"/>
 
 * A generative model p(x) consist of
   * A base model p(z) realized as an **autoregressive model**, which uses **graph neural network** (GNN) techniques to compute conditional distributions on a directed causal graph.
