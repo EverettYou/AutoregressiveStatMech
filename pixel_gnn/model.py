@@ -278,7 +278,7 @@ class TwoBody(EnergyTerm):
         energy = self.group.val(coupled, self.val_table) * self.strength
         return energy.sum(dims)
 
-class EnergyModel(nn.Module):
+class Energy(nn.Module):
     """ Energy mdoel that describes the physical system. Provides function to evaluate energy.
     
         Args:
@@ -287,13 +287,13 @@ class EnergyModel(nn.Module):
         lattice: a lattice system containing information of the group and lattice shape
     """
     def __init__(self, energy: EnergyTerms, group: Group, lattice: Lattice):
-        super(EnergyModel, self).__init__()
+        super(Energy, self).__init__()
         self.group = group
         self.lattice = lattice
         self.update(energy)
     
     def extra_repr(self):
-        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(EnergyModel, self).extra_repr()
+        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(Energy, self).extra_repr()
         
     def forward(self, input):
         return self.energy(input)
@@ -432,9 +432,9 @@ class GraphConv(nn.Module):
             for typ in range(typ0, self.edge_types):
                 mask = (self.graph[2] == typ)
                 if output is None:
-                    output = self.homo_propagate(self.graph[:2, mask], input, typ)
+                    output = self.propagate_homo(self.graph[:2, mask], input, typ)
                 else:
-                    output += self.homo_propagate(self.graph[:2, mask], input, typ)
+                    output += self.propagate_homo(self.graph[:2, mask], input, typ)
         else: # forward from specific node
             graph = self.graph
             mask = (graph[0] == j) # mask out edges from other nodes
@@ -442,10 +442,10 @@ class GraphConv(nn.Module):
             if not self.self_loop: # no self loop
                 mask = (graph[2] != 0) # mask out self loops
                 graph = graph[:, mask]
-            output = self.hetero_propagate(graph, input)
+            output = self.propagate_hetero(graph, input)
         return output
 
-    def homo_propagate(self, graph, input, typ):
+    def propagate_homo(self, graph, input, typ):
         [source, target] = graph
         signal = input[..., source, :] # shape [..., E, in_features]
         if self.bias is None:
@@ -456,7 +456,7 @@ class GraphConv(nn.Module):
                     dim = -2, dim_size = input.size(-2))
         return output # shape: [..., N, out_features]
 
-    def hetero_propagate(self, graph, input):
+    def propagate_hetero(self, graph, input):
         # input: shape [..., N, in_features]
         [source, target, edge_type] = graph
         signal = input[..., source, :] # shape [..., E, in_features]
@@ -469,7 +469,7 @@ class GraphConv(nn.Module):
                     dim = -2, dim_size = input.size(-2))
         return output # shape: [..., N, out_features]
 
-class AutoregressiveModel(nn.Module, dist.Distribution):
+class Autoregressive(nn.Module, dist.Distribution):
     """ Represent a generative model that can generate samples and evaluate log probabilities.
         
         Args:
@@ -480,7 +480,7 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
     """
     
     def __init__(self, lattice: Lattice, features, nonlinearity: str = 'Tanh', bias: bool = True):
-        super(AutoregressiveModel, self).__init__()
+        super(Autoregressive, self).__init__()
         self.lattice = lattice
         self.nodes = lattice.sites
         self.features = features
@@ -579,7 +579,7 @@ class HolographicPixelGNN(nn.Module, dist.TransformedDistribution):
         nonlinearity: activation function to use 
         bias: whether to learn the additive bias in heap linear layers
     """
-    def __init__(self, energy: EnergyModel, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
+    def __init__(self, energy: Energy, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
         super(HolographicPixelGNN, self).__init__()
         self.energy = energy
         self.group = energy.group
@@ -587,7 +587,7 @@ class HolographicPixelGNN(nn.Module, dist.TransformedDistribution):
         self.haar = HaarTransform(self.group, self.lattice)
         self.onecat = OneHotCategoricalTransform(self.group.order)
         features = [self.group.order] + hidden_features + [self.group.order]
-        auto = AutoregressiveModel(self.lattice, features, nonlinearity, bias)
+        auto = Autoregressive(self.lattice, features, nonlinearity, bias)
         dist.TransformedDistribution.__init__(self, auto, [self.onecat, self.haar])
         self.transform = dist.ComposeTransform(self.transforms)
 

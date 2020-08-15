@@ -19,7 +19,7 @@ hpGNN = model.HolographicPixelGNN(
                 H(0.440686793), # Ising critical point
                 model.SymmetricGroup(2), 
                 model.Lattice(4, 2)), 
-            hidden_features = [4, 4])
+            hidden_features = [4, 4]).to(model.device)
 optimizer = optim.Adam(hpGNN.parameters(), lr=0.02)
 
 x = hpGNN.sample(3)
