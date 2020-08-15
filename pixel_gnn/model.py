@@ -542,7 +542,7 @@ class Autoregressive(nn.Module, dist.Distribution):
                         cache[l + 1] += layer(cache[l], j)
                 else: # for other layers, only update node j (other nodes not ready yet)
                     src = layer(cache[l][..., [j], :])
-                    index = src.new_full(src.size(), j)
+                    index = src.new_full(src.size(), j, dtype=torch.long)
                     cache[l + 1] = cache[l + 1].scatter(-2, index, src)
             # the last cache hosts the logit, sample from it 
             cache[0][..., j, :] = sampler(cache[-1][..., j, :])
