@@ -29,9 +29,9 @@ train_loss = 0.
 free_energy = 0.
 echo = 100
 for epoch in range(2000):
-    x = model.sample(batch_size)
-    log_prob = model.log_prob(x)
-    energy = model.energy(x)
+    x = hpGNN.sample(batch_size)
+    log_prob = hpGNN.log_prob(x)
+    energy = hpGNN.energy(x)
     free = energy + log_prob.detach()
     meanfree = free.mean()
     loss = torch.sum(log_prob * (free - meanfree))
