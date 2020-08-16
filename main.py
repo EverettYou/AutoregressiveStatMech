@@ -20,11 +20,11 @@ hpGNN = model.HolographicPixelGNN(
                 H(0.440686793), # Ising critical point
                 model.SymmetricGroup(2), 
                 model.Lattice(4, 2)), 
-            8, 3).to(model.device)
+            8, 6).to(model.device)
 optimizer = optim.Adam(hpGNN.parameters(), lr=0.02)
 
 # training
-batch_size = 100
+batch_size = 500
 train_loss = 0.
 free_energy = 0.
 echo = 100
