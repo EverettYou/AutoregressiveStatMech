@@ -13,7 +13,7 @@ parser.add_argument('--hidden_features',
                     help='number of hidden features')
 parser.add_argument('--depth', 
                     type=int,
-                    default=6,
+                    default=1,
                     help='depth of RNN')
 parser.add_argument('--nonlinearity', 
                     type=str,
@@ -32,7 +32,7 @@ parser.add_argument('--batch_size',
                     default=5000,
                     help='batch size')
 parser.add_argument('--learning_rate', 
-                    type=int,
+                    type=float,
                     default=0.02,
                     help='batch size')
 
