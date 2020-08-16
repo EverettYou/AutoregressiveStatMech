@@ -29,7 +29,7 @@ parser.add_argument('--lattice_size',
                     help='lattice size')
 parser.add_argument('--batch_size', 
                     type=int,
-                    default=100,
+                    default=5000,
                     help='batch size')
 parser.add_argument('--learning_rate', 
                     type=int,
