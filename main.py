@@ -3,9 +3,40 @@ import torch
 import torch.optim as optim
 import pixel_gnn.model as model
 
-# set device
 parser = argparse.ArgumentParser()
-parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
+parser.add_argument('--disable-cuda', 
+                    action='store_true', 
+                    help='Disable CUDA')
+parser.add_argument('--hidden_features', 
+                    type=int,
+                    default=8,
+                    help='number of hidden features')
+parser.add_argument('--depth', 
+                    type=int,
+                    default=6,
+                    help='depth of RNN')
+parser.add_argument('--nonlinearity', 
+                    type=str,
+                    default='Tanh',
+                    help='nonlinearity to use')
+parser.add_argument('--bias', 
+                    type=bool,
+                    default=True,
+                    help='bias to learn')
+parser.add_argument('--lattice_size', 
+                    type=int,
+                    default=4,
+                    help='lattice size')
+parser.add_argument('--batch_size', 
+                    type=int,
+                    default=100,
+                    help='batch size')
+parser.add_argument('--learning_rate', 
+                    type=int,
+                    default=0.02,
+                    help='batch size')
+
+# set device
 args = parser.parse_args()
 if not args.disable_cuda and torch.cuda.is_available():
     model.device = torch.device('cuda')
@@ -19,12 +50,13 @@ hpGNN = model.HolographicPixelGNN(
             model.Energy(
                 H(0.440686793), # Ising critical point
                 model.SymmetricGroup(2), 
-                model.Lattice(4, 2)), 
-            8, 6).to(model.device)
-optimizer = optim.Adam(hpGNN.parameters(), lr=0.02)
+                model.Lattice(args.lattice_size, 2)), 
+            args.hidden_features, args.depth,
+            args.nonlinearity, args.bias).to(model.device)
+optimizer = optim.Adam(hpGNN.parameters(), lr=args.learning_rate)
 
 # training
-batch_size = 500
+batch_size = args.batch_size
 train_loss = 0.
 free_energy = 0.
 echo = 100
