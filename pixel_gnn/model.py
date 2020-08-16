@@ -78,7 +78,7 @@ class Lattice(object):
         index_list = [torch.tensor(sorted(list(gen[typ]))).t() for typ in gen]
         type_list = [torch.Tensor().new_full((1, len(gen[typ])), typ, dtype=torch.long) for typ in gen]
         graph = torch.cat([torch.cat(index_list, -1), torch.cat(type_list, -1)], 0)
-        return graph.to(device)
+        return graph
 
 class Group(object):
     """Represent a group, providing multiplication and inverse operation.
@@ -399,7 +399,7 @@ class GraphConv(nn.Module):
 
     def update_graph(self, graph):
         # update the graph, adding new linear maps if needed
-        self.graph = graph
+        self.graph = graph.to(device)
         edge_types = graph[-1].max() + 1
         if edge_types != self.edge_types:
             self.weight = nn.Parameter(torch.Tensor(edge_types, self.out_features, self.in_features))
@@ -474,97 +474,95 @@ class Autoregressive(nn.Module, dist.Distribution):
         
         Args:
         lattice: lattice system
-        features: a list of feature dimensions for all layers
+        visible_features: number of visible features on each node
+        hidden_features: number of hidden features on each node
+        depth: depth of the recurrent network
         nonlinearity: activation function to use 
         bias: whether to learn the bias
     """
     
-    def __init__(self, lattice: Lattice, features, nonlinearity: str = 'Tanh', bias: bool = True):
+    def __init__(self, lattice: Lattice, visible_features: int, hidden_features: int, depth: int, nonlinearity: str = 'Tanh', bias: bool = True):
         super(Autoregressive, self).__init__()
         self.lattice = lattice
         self.nodes = lattice.sites
-        self.features = features
-        dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.features[0]]))
+        self.visible_features = visible_features
+        self.hidden_features = hidden_features
+        self.depth = depth
+        dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.visible_features]))
         self.has_rsample = True
-        self.graph = self.lattice.causal_graph()
-        self.layers = nn.ModuleList()
-        for l in range(1, len(self.features)):
-            if l == 1: # the first layer should not have self loops
-                self.layers.append(GraphConv(self.graph, self.features[0], self.features[1], bias, self_loop = False))
-            else: # remaining layers are normal
-                self.layers.append(nn.LayerNorm([self.features[l - 1]]))
-                self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
-                self.layers.append(GraphConv(self.graph, self.features[l - 1], self.features[l], bias))
+        self.graph = self.lattice.causal_graph().to(device)
+        self.graph_conv_v2h = GraphConv(self.graph, self.visible_features, self.hidden_features, bias, self_loop = False)
+        self.graph_conv_h2h = GraphConv(self.graph, self.hidden_features, self.hidden_features, bias)
+        self.graph_conv_h2v = GraphConv(self.graph, self.hidden_features, self.visible_features, bias)
+        self.activate = getattr(nn, nonlinearity)()
 
     def update_graph(self, graph):
         # update graph for all GraphConv layers
-        self.graph = graph
+        self.graph = graph.to(device)
         for layer in self.layers:
             if isinstance(layer, GraphConv):
                 layer.update_graph(graph)
         return self
 
-    def forward(self, input):
-        output = input
-        for layer in self.layers: # apply layers
-            output = layer(output)
-        return output # logits
+    def forward(self, sample):
+        embedding = self.graph_conv_v2h(sample)
+        hidden = torch.zeros_like(embedding)
+        for l in range(self.depth):
+            hidden = self.graph_conv_h2h(self.activate(embedding + hidden))
+        logit = self.graph_conv_h2v(self.activate(embedding + hidden))
+        return logit
     
     def log_prob(self, sample):
-        logits = self(sample) # forward pass to get logits
-        return torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
+        logit = self(sample) # forward pass to get logit
+        return torch.sum(sample * F.log_softmax(logit, dim=-1), (-2,-1))
 
-    def sampler(self, logits, dim=-1): # simplified from F.gumbel_softmax
-        gumbels = -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        gumbels += logits.detach()
+    def sampler(self, logit, dim=-1): # simplified from F.gumbel_softmax
+        gumbels = -torch.empty_like(logit, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        gumbels += logit.detach()
         index = gumbels.max(dim, keepdim=True)[1]
-        return torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
+        return torch.zeros_like(logit, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
 
     def _sample(self, sample_size: int, sampler = None):
         if sampler is None: # if no sampler specified, use default
             sampler = self.sampler
-        # create a list of tensors to cache layer-wise outputs
-        cache = [torch.zeros(sample_size, self.nodes, self.features[0], device=device)]
-        for layer in self.layers:
-            if isinstance(layer, GraphConv): # for graph convolution layers
-                features = layer.out_features # features get updated
-            cache.append(torch.zeros(sample_size, self.nodes, features, device=device))
-        # cache established. start by sampling node 0.
+        # prepare cache tensors
+        sample = torch.zeros(sample_size, self.nodes, self.visible_features, device=device)
+        embedding = torch.zeros(sample_size, self.nodes, self.hidden_features, device=device)
+        hidden = [torch.zeros_like(embedding) for l in range(self.depth + 1)]
+        activated = [torch.zeros_like(embedding) for l in range(self.depth + 1)]
+        logit = torch.zeros_like(sample)
         # assuming global symmetry, node 0 is always sampled uniformly
-        cache[0][..., 0, :] = sampler(cache[0][..., 0, :])
+        sample[..., 0, :] = sampler(logit[..., 0, :])
         # start autoregressive sampling
         for j in range(1, self.nodes): # iterate through nodes 1:all
-            for l, layer in enumerate(self.layers):
-                if isinstance(layer, GraphConv): # for graph convolution layers
-                    if l==0: # first layer should forward from previous node
-                        cache[l + 1] += layer(cache[l], j - 1)
-                    else: # remaining layers forward from this node
-                        cache[l + 1] += layer(cache[l], j)
-                else: # for other layers, only update node j (other nodes not ready yet)
-                    src = layer(cache[l][..., [j], :])
-                    index = src.new_full(src.size(), j, dtype=torch.long)
-                    cache[l + 1] = cache[l + 1].scatter(-2, index, src)
-            # the last cache hosts the logit, sample from it 
-            cache[0][..., j, :] = sampler(cache[-1][..., j, :])
-        return cache # cache[0] hosts the sample
+            index = embedding.new_full((sample_size, 1, self.hidden_features), j, dtype=torch.long)
+            # embedding should forward from privious node
+            embedding += self.graph_conv_v2h(sample, j - 1)
+            for l in range(self.depth):
+                src = self.activate(embedding[..., [j], :] + hidden[l][..., [j], :])
+                activated[l] = activated[l].scatter(-2, index, src)
+                hidden[l + 1] += self.graph_conv_h2h(activated[l], j)
+            src = self.activate(embedding[..., [j], :] + hidden[-1][..., [j], :])
+            activated[-1] = activated[-1].scatter(-2, index, src)
+            logit += self.graph_conv_h2v(activated[-1], j)
+            sample[..., j, :] = sampler(logit[..., j, :])
+        return sample, logit
     
     def sample(self, sample_size=1):
         with torch.no_grad():
-            cache = self._sample(sample_size)
-        return cache[0]
+            sample, logit = self._sample(sample_size)
+        return sample
     
     def rsample(self, sample_size=1, tau=None, hard=False):
         # reparametrized Gumbel sampling
         if tau is None: # if temperature not given
             tau = 1/(self.features[-1]-1) # set by the out feature dimension
-        cache = self._sample(sample_size, lambda x: F.gumbel_softmax(x, tau, hard))
-        return cache[0]
+        sample, logit = self._sample(sample_size, lambda x: F.gumbel_softmax(x, tau, hard))
+        return sample
 
     def sample_with_log_prob(self, sample_size=1):
-        cache = self._sample(sample_size)
-        sample = cache[0]
-        logits = cache[-1]
-        log_prob = torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
+        sample, logit = self._sample(sample_size)
+        log_prob = torch.sum(sample * F.log_softmax(logit, dim=-1), (-2,-1))
         return sample, log_prob
 
 
@@ -575,19 +573,19 @@ class HolographicPixelGNN(nn.Module, dist.TransformedDistribution):
     
         Args:
         energy: a energy model to learn
-        hidden_features: a list of feature dimensions of hidden layers
+        hidden_feature: number of hidden features
+        depth: the depth of RNN
         nonlinearity: activation function to use 
         bias: whether to learn the additive bias in heap linear layers
     """
-    def __init__(self, energy: Energy, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
+    def __init__(self, energy: Energy, hidden_feature: int, depth: int, nonlinearity: str = 'Tanh', bias: bool = True):
         super(HolographicPixelGNN, self).__init__()
         self.energy = energy
         self.group = energy.group
         self.lattice = energy.lattice
         self.haar = HaarTransform(self.group, self.lattice)
         self.onecat = OneHotCategoricalTransform(self.group.order)
-        features = [self.group.order] + hidden_features + [self.group.order]
-        auto = Autoregressive(self.lattice, features, nonlinearity, bias)
+        auto = Autoregressive(self.lattice, self.group.order, hidden_feature, depth, nonlinearity, bias)
         dist.TransformedDistribution.__init__(self, auto, [self.onecat, self.haar])
         self.transform = dist.ComposeTransform(self.transforms)
 
