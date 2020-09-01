@@ -3,9 +3,11 @@ import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import torch.distributions as dist
+import torch.optim as optim
 import torch_scatter
+
+device = torch.device('cpu') # default
 
 """ -------- Infrastructures -------- """
 
@@ -33,13 +35,9 @@ class Lattice(object):
         """ Node initialization, calculate basic node information
             for other methods in this class to work.
             Called by class initialization. """
-        #self.node_levels = torch.zeros(self.sites, dtype=torch.int)
-        #self.node_centers = torch.zeros(self.sites, self.dimension, dtype=torch.float)
         self.node_index = torch.zeros(self.sites, dtype=torch.long)
         def partition(rng: torch.Tensor, dim: int, ind: int, lev: int):
             if rng[dim].sum()%2 == 0:
-                #self.node_levels[ind] = lev
-                #self.node_centers[ind] = rng.to(dtype=torch.float).mean(-1)
                 mid = rng[dim].sum()//2
                 rng1 = rng.clone()
                 rng1[dim, 1] = mid
@@ -80,7 +78,8 @@ class Lattice(object):
                 typ += 1
         index_list = [torch.tensor(sorted(list(gen[typ]))).t() for typ in gen]
         type_list = [torch.Tensor().new_full((1, len(gen[typ])), typ, dtype=torch.long) for typ in gen]
-        return torch.cat([torch.cat(index_list, -1), torch.cat(type_list, -1)], 0)
+        graph = torch.cat([torch.cat(index_list, -1), torch.cat(type_list, -1)], 0)
+        return graph.to(device)
 
 class Group(object):
     """Represent a group, providing multiplication and inverse operation.
@@ -90,10 +89,10 @@ class Group(object):
     """
     def __init__(self, mul_table: torch.Tensor):
         super(Group, self).__init__()
-        self.mul_table = mul_table
+        self.mul_table = mul_table.to(device)
         self.order = mul_table.size(0) # number of group elements
         gs, ginvs = torch.nonzero(self.mul_table == 0, as_tuple=True)
-        self.inv_table = torch.gather(ginvs, 0, gs)
+        self.inv_table = torch.gather(ginvs, 0, gs).to(device)
         self.val_table = None
     
     def __iter__(self):
@@ -125,12 +124,13 @@ class Group(object):
             val_table = self.default_val_table()
         elif len(val_table) != self.order:
             raise ValueError('Group function value table must be of the same size as the group order, expect {} got {}.'.format(self.order, len(val_table)))
-        return torch.gather(val_table.expand(input.size()[:-1]+(-1,)), -1, input)
+        return torch.gather(val_table.to(device).expand(input.size()[:-1]+(-1,)), -1, input)
 
     def default_val_table(self):
         if self.val_table is None:
-            self.val_table = torch.zeros(self.order)
-            self.val_table[0] = 1.
+            val_table = torch.zeros(self.order)
+            val_table[0] = 1.
+            self.val_table = val_table
         return self.val_table
 
 class SymmetricGroup(Group):
@@ -154,7 +154,8 @@ class SymmetricGroup(Group):
                     return cycle_number(tuple(a - 1 for a in g[1:])) + 1
                 else:
                     return cycle_number(tuple(g[0] - 1 if a == 0 else a - 1 for a in g[1:]))
-            self.val_table = torch.tensor([cycle_number(g) for g in self.elements], dtype=torch.float)
+            val_table = torch.tensor([cycle_number(g) for g in self.elements], dtype=torch.float)
+            self.val_table = val_table.to(device)
         return self.val_table
 
 
@@ -278,7 +279,7 @@ class TwoBody(EnergyTerm):
         energy = self.group.val(coupled, self.val_table) * self.strength
         return energy.sum(dims)
 
-class EnergyModel(nn.Module):
+class Model(nn.Module):
     """ Energy mdoel that describes the physical system. Provides function to evaluate energy.
     
         Args:
@@ -287,13 +288,13 @@ class EnergyModel(nn.Module):
         lattice: a lattice system containing information of the group and lattice shape
     """
     def __init__(self, energy: EnergyTerms, group: Group, lattice: Lattice):
-        super(EnergyModel, self).__init__()
+        super(Model, self).__init__()
         self.group = group
         self.lattice = lattice
-        self.update(energy)
+        self.update(energy) # defines self.energy on group and lattice
     
     def extra_repr(self):
-        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(EnergyModel, self).extra_repr()
+        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(Model, self).extra_repr()
         
     def forward(self, input):
         return self.energy(input)
@@ -320,15 +321,16 @@ class HaarTransform(dist.Transform):
         
     # construct Haar wavelet basis
     def make_wavelet(self):
-        self.wavelet = torch.zeros(torch.Size([self.lattice.sites, self.lattice.sites]), dtype=torch.int)
-        self.wavelet[0] = 1
+        wavelet = torch.zeros(torch.Size([self.lattice.sites, self.lattice.sites]), dtype=torch.int)
+        wavelet[0] = 1
         for z in range(1,self.lattice.tree_depth):
             block_size = 2**(z-1)
             for q in range(block_size):
                 node_range = 2**(self.lattice.tree_depth-1-z) * torch.tensor([2*q+1,2*q+2])
                 nodes = torch.arange(*node_range)
                 sites = self.lattice.node_index[nodes]
-                self.wavelet[block_size + q, sites] = 1 
+                wavelet[block_size + q, sites] = 1 
+        self.wavelet = wavelet.to(device)
                 
     def _call(self, z):
         x = self.group.prod(z.unsqueeze(-1) * self.wavelet, -2)
@@ -431,9 +433,9 @@ class GraphConv(nn.Module):
             for typ in range(typ0, self.edge_types):
                 mask = (self.graph[2] == typ)
                 if output is None:
-                    output = self.homo_propagate(self.graph[:2, mask], input, typ)
+                    output = self.propagate_homo(self.graph[:2, mask], input, typ)
                 else:
-                    output += self.homo_propagate(self.graph[:2, mask], input, typ)
+                    output += self.propagate_homo(self.graph[:2, mask], input, typ)
         else: # forward from specific node
             graph = self.graph
             mask = (graph[0] == j) # mask out edges from other nodes
@@ -441,10 +443,10 @@ class GraphConv(nn.Module):
             if not self.self_loop: # no self loop
                 mask = (graph[2] != 0) # mask out self loops
                 graph = graph[:, mask]
-            output = self.hetero_propagate(graph, input)
+            output = self.propagate_hetero(graph, input)
         return output
 
-    def homo_propagate(self, graph, input, typ):
+    def propagate_homo(self, graph, input, typ):
         [source, target] = graph
         signal = input[..., source, :] # shape [..., E, in_features]
         if self.bias is None:
@@ -455,7 +457,7 @@ class GraphConv(nn.Module):
                     dim = -2, dim_size = input.size(-2))
         return output # shape: [..., N, out_features]
 
-    def hetero_propagate(self, graph, input):
+    def propagate_hetero(self, graph, input):
         # input: shape [..., N, in_features]
         [source, target, edge_type] = graph
         signal = input[..., source, :] # shape [..., E, in_features]
@@ -468,7 +470,7 @@ class GraphConv(nn.Module):
                     dim = -2, dim_size = input.size(-2))
         return output # shape: [..., N, out_features]
 
-class AutoregressiveModel(nn.Module, dist.Distribution):
+class Autoregressive(nn.Module, dist.Distribution):
     """ Represent a generative model that can generate samples and evaluate log probabilities.
         
         Args:
@@ -479,7 +481,7 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
     """
     
     def __init__(self, lattice: Lattice, features, nonlinearity: str = 'Tanh', bias: bool = True):
-        super(AutoregressiveModel, self).__init__()
+        super(Autoregressive, self).__init__()
         self.lattice = lattice
         self.nodes = lattice.sites
         self.features = features
@@ -491,7 +493,7 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
             if l == 1: # the first layer should not have self loops
                 self.layers.append(GraphConv(self.graph, self.features[0], self.features[1], bias, self_loop = False))
             else: # remaining layers are normal
-                self.layers.append(nn.LayerNorm([self.features[l - 1]]))
+                #self.layers.append(nn.LayerNorm([self.features[l - 1]]))
                 self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
                 self.layers.append(GraphConv(self.graph, self.features[l - 1], self.features[l], bias))
 
@@ -523,11 +525,11 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
         if sampler is None: # if no sampler specified, use default
             sampler = self.sampler
         # create a list of tensors to cache layer-wise outputs
-        cache = [torch.zeros(sample_size, self.nodes, self.features[0])]
+        cache = [torch.zeros(sample_size, self.nodes, self.features[0], device=device)]
         for layer in self.layers:
             if isinstance(layer, GraphConv): # for graph convolution layers
                 features = layer.out_features # features get updated
-            cache.append(torch.zeros(sample_size, self.nodes, features))
+            cache.append(torch.zeros(sample_size, self.nodes, features, device=device))
         # cache established. start by sampling node 0.
         # assuming global symmetry, node 0 is always sampled uniformly
         cache[0][..., 0, :] = sampler(cache[0][..., 0, :])
@@ -541,7 +543,7 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
                         cache[l + 1] += layer(cache[l], j)
                 else: # for other layers, only update node j (other nodes not ready yet)
                     src = layer(cache[l][..., [j], :])
-                    index = torch.tensor(j).view([1]*src.dim()).expand(src.size())
+                    index = src.new_full(src.size(), j, dtype=torch.long)
                     cache[l + 1] = cache[l + 1].scatter(-2, index, src)
             # the last cache hosts the logit, sample from it 
             cache[0][..., j, :] = sampler(cache[-1][..., j, :])
@@ -569,28 +571,35 @@ class AutoregressiveModel(nn.Module, dist.Distribution):
 
 """ -------- Model Interface -------- """
 
-class HolographicPixelGCN(nn.Module, dist.TransformedDistribution):
+class HolographicPixelGNN(nn.Module, dist.TransformedDistribution):
     """ Combination of hierarchical autoregressive and flow-based model for lattice models.
     
         Args:
-        energy: a energy model to learn
+        model: a energy model to learn
         hidden_features: a list of feature dimensions of hidden layers
         nonlinearity: activation function to use 
         bias: whether to learn the additive bias in heap linear layers
     """
-    def __init__(self, energy: EnergyModel, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
-        super(HolographicPixelGCN, self).__init__()
-        self.energy = energy
-        self.group = energy.group
-        self.lattice = energy.lattice
+    def __init__(self, model: Model, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
+        super(HolographicPixelGNN, self).__init__()
+        self.model = model
+        self.energy = model.energy
+        self.group = model.group
+        self.lattice = model.lattice
         self.haar = HaarTransform(self.group, self.lattice)
         self.onecat = OneHotCategoricalTransform(self.group.order)
         features = [self.group.order] + hidden_features + [self.group.order]
-        auto = AutoregressiveModel(self.lattice, features, nonlinearity, bias)
+        auto = Autoregressive(self.lattice, features, nonlinearity, bias)
         dist.TransformedDistribution.__init__(self, auto, [self.onecat, self.haar])
         self.transform = dist.ComposeTransform(self.transforms)
 
 
+    def free_energy(self, x):
+        dims = tuple(range(-self.lattice.dimension,0))
+        translation = itertools.product(*([range(self.lattice.size)]*self.lattice.dimension))
+        log_probs = torch.stack([self.log_prob(x.roll(shifts=shifts, dims=dims)) for shifts in translation])
+        log_prob = log_probs.logsumexp(0) - math.log(self.lattice.sites)
+        return self.energy(x) + log_prob
 
 
 
