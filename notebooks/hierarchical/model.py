@@ -5,83 +5,247 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as dist
 import torch.optim as optim
-import torch_scatter
 
-device = torch.device('cpu') # default
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
 
 """ -------- Infrastructures -------- """
+class Graph(object):
+    """ Host graph information and enables graph expansion
+        
+        Args:
+        dims: (target_dim, source_dim) number of target/source variables
+        indices: index list of adjacency matrix [2, edge_num]
+        edge_types: edge type list of adjacency matrix [edge_num]
+        source_depths (optional): depth assignments of source variables
+    """
+    def __init__(self, dims:int or tuple, indices, edge_types, source_depths=None):
+        if isinstance(dims, int):
+            self.dims = (dims, dims)
+        elif isinstance(dims, tuple):
+            self.dims = dims
+        self.indices = indices
+        self.edge_types = edge_types
+        self.max_edge_type = edge_types.max().item()
+        if source_depths is None:
+            self.source_depths = self.get_depth_assignment()
+        else:
+            self.source_depths = source_depths
+        self.edge_depths = self.source_depths[self.indices[1,:]]
+        self.max_depth = self.source_depths.max().item()
+        
+    def __repr__(self):
+        return 'Graph({}, {} edges of {} types)'.format('x'.join(str(v) for v in self.dims), self.edge_types.shape[0], self.max_edge_type)
+    
+    def adjacency_matrix(self):
+        return torch.sparse_coo_tensor(self.indices, self.edge_types, self.dims)
+    
+    def get_depth_assignment(self):
+        assert self.dims[0] == self.dims[1], 'get_depths can only be called with square adjacency matrix.'
+        dvec = torch.zeros(self.dims[0], dtype=torch.long)
+        uvec = torch.ones(self.dims[0], dtype=torch.long)
+        adjmat = self.adjacency_matrix()
+        while True:
+            uvec_new = (adjmat @ uvec > 0).long()
+            if uvec_new.sum() == uvec.sum():
+                break
+            uvec = uvec_new
+            dvec += uvec
+        if uvec.sum() != 0: # there are nodes trapped in loops
+            raise Warning('When assigning depth, discover the following vertices trapped in loops: {}'.format(torch.nonzero(uvec,as_tuple=True)[0].tolist()))
+        return dvec
+    
+    def add_self_loops(self, start = 0):
+        # start: the sarting node from which on the self-loop should be added
+        assert self.dims[0] == self.dims[1], 'add_self_loops can only be called with square adjacency matrix.'
+        loops = torch.arange(start, self.dims[0])
+        indices_prepend = torch.stack([loops, loops])
+        edge_types_prepend = torch.ones(loops.shape, dtype=torch.long)
+        indices = torch.cat([indices_prepend, self.indices], -1)
+        edge_types = torch.cat([edge_types_prepend, self.edge_types+1], -1)
+        return Graph(self.dims, indices, edge_types, self.source_depths)
+    
+    def expand(self, target_dim, source_dim):
+        # prepare views
+        indices = self.indices.view(2,-1,1,1)
+        edge_types = self.edge_types.view(-1,1,1)
+        target_inds = torch.arange(target_dim).view(-1,1)
+        source_inds = torch.arange(source_dim).view(1,-1)
+        # calculate indices extension
+        target_inds_ext = indices[0,...] * target_dim + target_inds
+        source_inds_ext = indices[1,...] * source_dim + source_inds
+        # calculate edge type extension
+        edge_types_ext = ((edge_types - 1) * target_dim + target_inds) * source_dim + source_inds + 1
+        # expand and flatten tensor
+        target_inds_ext = target_inds_ext.expand(edge_types_ext.shape).flatten()
+        source_inds_ext = source_inds_ext.expand(edge_types_ext.shape).flatten()
+        edge_types_ext = edge_types_ext.flatten()
+        # expand depths (to the source side)
+        source_depths_ext = self.source_depths.repeat_interleave(source_dim)
+        dims_ext = (self.dims[0] * target_dim, self.dims[1] * source_dim)
+        indices_ext = torch.stack([target_inds_ext, source_inds_ext])
+        return Graph(dims_ext, indices_ext, edge_types_ext, source_depths_ext)
+    
+    def sparse_matrix(self, vector, depth = None):
+        if depth is None:
+            indices = self.indices
+            edge_types = self.edge_types
+        else:
+            select = self.edge_depths == depth
+            indices = self.indices[:, select]
+            edge_types = self.edge_types[select]
+        return torch.sparse_coo_tensor(indices, vector[edge_types-1], self.dims)
 
+class Node(object):
+    """ Represent a node object, containing coordinate and relationship information.
+    """
+    def __init__(self, ind:int):
+        self.type = None
+        self.ind = ind
+        self.center = None
+        self.generation = None
+        self.parent = None
+        self.children = [None, None]
+        self.site = None
+        
+    def __repr__(self):
+        return 'Node({})'.format(self.ind)
+    
+    def ancestors(self):
+        # ancestor = self + ancestor of parent
+        if self.parent is not None:
+            return [self] + self.parent.ancestors()
+        else:
+            return []
+    
+    def shadow_sites(self):
+        # shadow_sites = sum of shadow_sites of children
+        if self.type is 'lat':
+            shd = []
+            for node in self.children:
+                shd += node.shadow_sites()
+            return shd
+        elif self.type is 'phy':
+            return [self.site]
+        
+    def action_sites(self):
+        # action_sites = shadow_sites of last child
+        if self.type is 'lat':
+            return self.children[-1].shadow_sites()
+        elif self.type is 'phy':
+            return []
+    
 class Lattice(object):
     """ Hosts lattice information and construct causal graph
         
         Args:
         size: number of size along one dimension (assuming square/cubical lattice)
+              must be a power of 2 for binary tree construction
         dimension: dimension of the lattice
     """
     def __init__(self, size:int, dimension:int):
+        assert (size & (size-1) == 0) and size != 0, "size must be a power of 2."
+        assert dimension > 0, "dimension must be a positive integer."
         self.size = size
         self.dimension = dimension
-        self.shape = [size]*dimension
         self.sites = size**dimension
-        self.tree_depth = self.sites.bit_length()
-        self.node_init()
-        
-    def __repr__(self):
-        return 'Lattice({} grid with tree depth {})'.format(
-                    'x'.join(str(L) for L in self.shape),
-                     self.tree_depth)
-    
-    def node_init(self):
-        """ Node initialization, calculate basic node information
-            for other methods in this class to work.
-            Called by class initialization. """
-        self.node_index = torch.zeros(self.sites, dtype=torch.long)
-        def partition(rng: torch.Tensor, dim: int, ind: int, lev: int):
+        self.nodes = [Node(i) for i in range(2*self.sites)]
+        self.nodes[0].type = 'lat'
+        self.nodes[0].generation = 0
+        self.nodes[0].children = [self.nodes[1]]
+        self.nodes[1].parent = self.nodes[0]
+        def partition(rng: torch.Tensor, dim: int, ind: int, gen: int):
+            this_node = self.nodes[ind]
+            this_node.center = rng.float().mean(-1)
+            this_node.generation = gen
             if rng[dim].sum()%2 == 0:
+                this_node.type = 'lat'
                 mid = rng[dim].sum()//2
                 rng1 = rng.clone()
                 rng1[dim, 1] = mid
                 rng2 = rng.clone()
                 rng2[dim, 0] = mid
-                partition(rng1, (dim + 1)%self.dimension, 2*ind, lev+1)
-                partition(rng2, (dim + 1)%self.dimension, 2*ind + 1, lev+1)
+                ind1 = (ind-2**gen)+2*2**gen
+                ind2 = (ind-2**gen)+3*2**gen
+                partition(rng1, (dim + 1)%self.dimension, ind1, gen+1)
+                partition(rng2, (dim + 1)%self.dimension, ind2, gen+1)
+                this_node.children = [self.nodes[ind1], self.nodes[ind2]]
+                self.nodes[ind1].parent = this_node
+                self.nodes[ind2].parent = this_node
             else:
-                self.node_index[ind-self.sites] = rng[:,0].dot(self.size**torch.arange(0,self.dimension).flip(0))
-        partition(torch.tensor([[0, self.size]]*self.dimension), 0, 1, 1)
+                this_node.type = 'phy'
+                this_node.site = rng[:,0].dot(self.size**torch.arange(0,self.dimension).flip(0)).item()
+        partition(torch.tensor([[0, self.size]]*self.dimension), 0, 1, 0)
+        
+    def __repr__(self):
+        return 'Lattice({} grid)'.format('x'.join(str(self.size) for k in range(self.dimension)))
     
-    def causal_graph(self, k = 3):
-        """ Construct causal graph 
-            Args: k - number of generations to consider
-        """
-        self.family = {} # a dict hosting all relatives
-        def child(i, k): # kth-generation child of node i
-            return set(2**k * i + q for q in range(2**k))
-        def relative(k0, k1): # (k0, k1)-relatives
-            # two nodes i0 and i1 are (k0, k1)-relative,
-            # if their closest common ancestor is k0 and k1 generations from them respectively
-            if (k0, k1) not in self.family: # if relation not found
-                rels = set() # start collecting relative relations
-                for i in range(1, self.sites//2**max(k0, k1)): # for every possible common ancestor
-                    ch0 = child(i, k0) # set of k0-child
-                    ch1 = child(i, k1) # set of k1-child
-                    rels |= set((i0, i1) for i0 in ch0 for i1 in ch1 if i0 <= i1)
-                for k in range(min(k0, k1)): # exlusing closer relatives
-                    rels -= relative(k0 - k - 1, k1 - k - 1)
-                self.family[(k0, k1)] = rels # record the relations
-            return self.family[(k0, k1)]
-        # collect all relatives within k generations
-        typ = 0
-        gen = {}
-        for k1 in range(0, k):
-            for k0  in range(0, k1 + 1):
-                gen[typ] = relative(k0, k1)
-                typ += 1
-        index_list = [torch.tensor(sorted(list(gen[typ]))).t() for typ in gen]
-        type_list = [torch.Tensor().new_full((1, len(gen[typ])), typ, dtype=torch.long) for typ in gen]
-        graph = torch.cat([torch.cat(index_list, -1), torch.cat(type_list, -1)], 0)
-        return graph.to(device)
-
-class Group(object):
+    def wavelet_maps(self):
+        decoder_map = torch.zeros((self.sites,self.sites), dtype=torch.long)
+        for node in self.nodes:
+            if node.type is 'lat':
+                source = node.ind
+                for target in node.action_sites():
+                    decoder_map[target, source] = 1
+        encoder_map = torch.inverse(decoder_map.double()).round().long()
+        return encoder_map, decoder_map
+                    
+    def relevant_nodes(self, node, radius = 1.):
+        # relevant_nodes = union of ancestors of adjacent nodes within given radius
+        scaled_radius = radius * self.size / 2**(node.generation/self.dimension)
+        relevant_nodes = set()
+        for prior_node in self.nodes[1:node.ind]:
+            displacement = prior_node.center - node.center
+            displacement = (displacement + self.size/2)%self.size - self.size/2
+            if displacement.norm() < scaled_radius:
+                relevant_nodes.update(prior_node.ancestors())
+        return relevant_nodes
+    
+    def common_ancestor(self, node1, node2):
+        # the closest common ancestor of two nodes
+        common_ancestor = None
+        while common_ancestor is None:
+            if node1.generation == node2.generation:
+                if node1 is node2:
+                    common_ancestor = node1
+                else:
+                    node1 = node1.parent
+                    node2 = node2.parent
+            elif node1.generation < node2.generation:
+                node2 = node2.parent
+            else: # node1.generation > node2.generation
+                node1 = node1.parent
+        return common_ancestor
+    
+    def relationship(self, node1, node2):
+        common_ancestor = self.common_ancestor(node1, node2)
+        return (node1.generation - common_ancestor.generation, node2.generation - common_ancestor.generation)
+    
+    def causal_graph(self, radius = 1.):
+        relations = set()
+        edges = {}
+        for target_node in self.nodes[1:]:
+            if target_node.type is 'lat':
+                for source_node in self.relevant_nodes(target_node, radius):
+                    relation = self.relationship(source_node, target_node)
+                    relations.add(relation)
+                    edges[(target_node.ind, source_node.ind)] = relation
+        relations = list(relations)
+        relations.sort()
+        type_map = {relation: k+1 for k, relation in enumerate(relations)}
+        indices = torch.zeros((2, len(edges)), dtype = torch.long)
+        edge_types = torch.zeros(len(edges), dtype = torch.long)
+        for k, (edge, relation) in enumerate(edges.items()):
+            indices[0, k] = edge[0]
+            indices[1, k] = edge[1]
+            edge_types[k] = type_map[relation]
+        graph = Graph(self.sites, indices, edge_types)
+        graph.type_dict = {edge_type: relation for relation, edge_type in type_map.items()}
+        return graph
+    
+class Group(nn.Module):
     """Represent a group, providing multiplication and inverse operation.
     
     Args:
@@ -89,49 +253,44 @@ class Group(object):
     """
     def __init__(self, mul_table: torch.Tensor):
         super(Group, self).__init__()
-        self.mul_table = mul_table.to(device)
-        self.order = mul_table.size(0) # number of group elements
+        self.mul_table = mul_table
+        self.order = mul_table.shape[0] # number of group elements
         gs, ginvs = torch.nonzero(self.mul_table == 0, as_tuple=True)
-        self.inv_table = torch.gather(ginvs, 0, gs).to(device)
-        self.val_table = None
+        self.inv_table = torch.gather(ginvs, 0, gs)
     
     def __iter__(self):
         return iter(range(self.order))
     
     def __repr__(self):
-        return 'Group({} elements)'.format(self.order)
+        return 'Group(order={})'.format(self.order)
     
     def inv(self, input: torch.Tensor):
-        return torch.gather(self.inv_table.expand(input.size()[:-1]+(-1,)), -1, input)
+        return self.inv_table.to(input.device)[input]
+    
+    def mod(self, input: torch.Tensor):
+        output = input
+        output[output < 0] = self.inv(output[output < 0].abs())
+        return output
     
     def mul(self, input1: torch.Tensor, input2: torch.Tensor):
-        output = input1 * self.order + input2
-        return torch.gather(self.mul_table.flatten().expand(output.size()[:-1]+(-1,)), -1, output)
+        return self.mul_table.flatten().to(input1.device)[input1 * self.order + input2]
     
     def prod(self, input, dim: int, keepdim: bool = False):
-        input_size = input.size()
-        flat_mul_table = self.mul_table.flatten().expand(input_size[:dim]+input_size[dim+1:-1]+(-1,))
         output = input.select(dim, 0)
-        for i in range(1, input.size(dim)):
-            output = output * self.order + input.select(dim, i)
-            output = torch.gather(flat_mul_table, -1, output)
+        for i in range(1, input.shape[dim]):
+            output = self.mul(output, input.select(dim, i))
         if keepdim:
             output = output.unsqueeze(dim)
         return output
     
-    def val(self, input, val_table = None):
-        if val_table is None:
-            val_table = self.default_val_table()
-        elif len(val_table) != self.order:
-            raise ValueError('Group function value table must be of the same size as the group order, expect {} got {}.'.format(self.order, len(val_table)))
-        return torch.gather(val_table.to(device).expand(input.size()[:-1]+(-1,)), -1, input)
+    def forward(self, input, val_table):
+        assert len(val_table) == self.order, 'Group function value table must be of the same size as the group order, expect {} got {}.'.format(self.order, len(val_table))
+        return val_table.to(input.device)[input]
 
     def default_val_table(self):
-        if self.val_table is None:
-            val_table = torch.zeros(self.order)
-            val_table[0] = 1.
-            self.val_table = val_table
-        return self.val_table
+        val_table = torch.zeros(self.order)
+        val_table[0] = 1.
+        return val_table
 
 class SymmetricGroup(Group):
     """ Represent a permutation group """
@@ -146,17 +305,15 @@ class SymmetricGroup(Group):
         super(SymmetricGroup, self).__init__(mul_table)
 
     def default_val_table(self):
-        if self.val_table is None:
-            def cycle_number(g):
-                if len(g) == 0:
-                    return 0
-                elif g[0] == 0:
-                    return cycle_number(tuple(a - 1 for a in g[1:])) + 1
-                else:
-                    return cycle_number(tuple(g[0] - 1 if a == 0 else a - 1 for a in g[1:]))
-            val_table = torch.tensor([cycle_number(g) for g in self.elements], dtype=torch.float)
-            self.val_table = val_table.to(device)
-        return self.val_table
+        def cycle_number(g):
+            if len(g) == 0:
+                return 0
+            elif g[0] == 0:
+                return cycle_number(tuple(a - 1 for a in g[1:])) + 1
+            else:
+                return cycle_number(tuple(g[0] - 1 if a == 0 else a - 1 for a in g[1:]))
+        val_table = torch.tensor([cycle_number(g) for g in self.elements], dtype=torch.float)
+        return val_table
 
 
 """ -------- Energy Model -------- """
@@ -164,10 +321,12 @@ class SymmetricGroup(Group):
 class EnergyTerm(nn.Module):
     """ represent an energy term"""
     strength = 1.
-    group = None
-    lattice = None
-    def __init__(self):
+    def __init__(self, val_table = None):
         super(EnergyTerm, self).__init__()
+        if val_table is None:
+            self.val_table = None
+        else:
+            self.val_table = torch.tensor(val_table)
         
     def __mul__(self, other):
         self.strength *= other
@@ -197,46 +356,14 @@ class EnergyTerm(nn.Module):
     def extra_repr(self):
         return '{}'.format(self.strength)
         
-    def on(self, group: Group = None, lattice: Lattice = None):
-        self.group = group
-        self.lattice = lattice
-        return self
-        
-    def forward(self):
-        if self.group is None:
-            raise RuntimeError('A group structure has not been linked before forward evaluation of the energy term. Call self.on(group = group) to link a Group.')
-        if self.lattice is None:
-            raise RuntimeError('A lattice system has not been linked before forward evaluation of the energy term. Call self.on(lattice = lattice) to link a Lattice.')
-
-class EnergyTerms(nn.ModuleList):
-    """ represent a sum of energy terms"""
-    def __init__(self, *arg):
-        super(EnergyTerms, self).__init__(*arg)
-    
-    def __mul__(self, other):
-        for term in self:
-            term = term * other
-        return self
-        
-    def __rmul__(self, other):
-        return self * other
-    
-    def __neg__(self):
-        return self * (-1)
-    
-    def on(self, group: Group = None, lattice: Lattice = None):
-        for term in self:
-            term.on(group, lattice)
-        return self
-    
-    def forward(self, input):
-        return sum(term(input) for term in self)
+    def forward(self, lattice, group):
+        if self.val_table is None:
+            self.val_table = group.default_val_table()
 
 class OnSite(EnergyTerm):
     """ on-site energy term """
     def __init__(self, val_table = None):
-        super(OnSite, self).__init__()
-        self.val_table = val_table
+        super(OnSite, self).__init__(val_table)
     
     def extra_repr(self):
         if not self.val_table is None:
@@ -244,17 +371,16 @@ class OnSite(EnergyTerm):
         else:
             return super(OnSite, self).extra_repr()
     
-    def forward(self, input):
-        super(OnSite, self).forward()
-        dims = tuple(range(-self.lattice.dimension,0))
-        energy = self.group.val(input, self.val_table) * self.strength
+    def forward(self, input, lattice, group):
+        super(OnSite, self).forward(lattice, group)
+        dims = tuple(range(-lattice.dimension,0))
+        energy = group(input, self.val_table) * self.strength
         return energy.sum(dims)
     
 class TwoBody(EnergyTerm):
     """ two-body interaction term """
-    def __init__(self, val_table = None, shifts = None):
-        super(TwoBody, self).__init__()
-        self.val_table = val_table
+    def __init__(self, shifts = None, val_table = None):
+        super(TwoBody, self).__init__(val_table)
         self.shifts = shifts
         
     def extra_repr(self):
@@ -269,15 +395,34 @@ class TwoBody(EnergyTerm):
         else:
             return super(TwoBody, self).extra_repr()
         
-    def forward(self, input):
-        super(TwoBody, self).forward()
-        dims = tuple(range(-self.lattice.dimension,0))
+    def forward(self, input, lattice, group):
+        super(TwoBody, self).forward(lattice, group)
+        dims = tuple(range(-lattice.dimension,0))
         if self.shifts is None:
-            self.shifts = (0,)*self.lattice.dimension
-        rolled = self.group.inv(input.roll(self.shifts, dims))
-        coupled = self.group.mul(rolled, input)
-        energy = self.group.val(coupled, self.val_table) * self.strength
+            self.shifts = [0]*lattice.dimension
+        rolled = group.inv(input.roll(self.shifts, dims))
+        coupled = group.mul(rolled, input)
+        energy = group(coupled, self.val_table) * self.strength
         return energy.sum(dims)
+    
+class EnergyTerms(nn.ModuleList):
+    """ represent a sum of energy terms"""
+    def __init__(self, *args):
+        super(EnergyTerms, self).__init__(*args)
+    
+    def __mul__(self, other):
+        for term in self:
+            term = term * other
+        return self
+        
+    def __rmul__(self, other):
+        return self * other
+    
+    def __neg__(self):
+        return self * (-1)
+    
+    def forward(self, input, lattice, group):
+        return sum(term(input, lattice, group) for term in self)
 
 class Model(nn.Module):
     """ Energy mdoel that describes the physical system. Provides function to evaluate energy.
@@ -287,20 +432,17 @@ class Model(nn.Module):
         group: a specifying the group on each site
         lattice: a lattice system containing information of the group and lattice shape
     """
-    def __init__(self, energy: EnergyTerms, group: Group, lattice: Lattice):
+    def __init__(self, energy: EnergyTerms, lattice: Lattice, group: Group):
         super(Model, self).__init__()
-        self.group = group
         self.lattice = lattice
-        self.update(energy) # defines self.energy on group and lattice
+        self.group = group
+        self.energy = energy
     
     def extra_repr(self):
-        return '(group): {}\n(lattice): {}'.format(self.group, self.lattice) + super(Model, self).extra_repr()
+        return '(lattice): {}'.format(self.lattice)
         
     def forward(self, input):
-        return self.energy(input)
-
-    def update(self, energy):
-        self.energy = energy.on(self.group, self.lattice)
+        return self.energy(input, self.lattice, self.group)
 
 """ -------- Transformations -------- """
 
@@ -312,41 +454,20 @@ class HaarTransform(dist.Transform):
         group: a group structure for each unit
         lattice: a lattice system containing information of the group and lattice shape
     """
-    def __init__(self, group: Group, lattice: Lattice):
+    def __init__(self, lattice: Lattice, group: Group):
         super(HaarTransform, self).__init__()
-        self.group = group
         self.lattice = lattice
+        self.group = group
         self.bijective = True
-        self.make_wavelet()
-        
-    # construct Haar wavelet basis
-    def make_wavelet(self):
-        wavelet = torch.zeros(torch.Size([self.lattice.sites, self.lattice.sites]), dtype=torch.int)
-        wavelet[0] = 1
-        for z in range(1,self.lattice.tree_depth):
-            block_size = 2**(z-1)
-            for q in range(block_size):
-                node_range = 2**(self.lattice.tree_depth-1-z) * torch.tensor([2*q+1,2*q+2])
-                nodes = torch.arange(*node_range)
-                sites = self.lattice.node_index[nodes]
-                wavelet[block_size + q, sites] = 1 
-        self.wavelet = wavelet.to(device)
+        self.encoding_mat, self.decoding_mat = self.lattice.wavelet_maps()
                 
     def _call(self, z):
-        x = self.group.prod(z.unsqueeze(-1) * self.wavelet, -2)
-        return x.view(z.size()[:-1]+torch.Size(self.lattice.shape))
+        x = self.group.prod(z.unsqueeze(-2) * self.decoding_mat.to(z.device), -1)
+        return x.view(z.shape[:-1]+(self.lattice.size,)*self.lattice.dimension)
     
-    def _inverse(self, x):
-        y = x.flatten(-self.lattice.dimension)[...,self.lattice.node_index]
-        def renormalize(y):
-            if y.size(-1) > 1:
-                y0 = y[...,0::2]
-                y1 = y[...,1::2]
-                return torch.cat((renormalize(y0), self.group.mul(self.group.inv(y0), y1)), -1)
-            else:
-                return y
-        z = renormalize(y)
-        return z
+    def _inverse(self, x): 
+        x = x.flatten(-self.lattice.dimension)
+        return self.group.prod(self.group.mod(x.unsqueeze(-2) * self.encoding_mat.to(x.device)), -1)
     
     def log_abs_det_jacobian(self, x, y):
         return torch.tensor(0.)
@@ -372,239 +493,196 @@ class OneHotCategoricalTransform(dist.Transform):
     def log_abs_det_jacobian(self, x, y):
         return torch.tensor(0.)
 
-""" -------- Base Distribution -------- """
+""" -------- Graph Convolution -------- """
 
-class GraphConv(nn.Module):
+class GraphConvLayer(nn.Module):
     """ Graph Convolution layer 
         
         Args:
-        graph: tensor of shape [3, num_edges] 
-               specifying (source, target, type) along each column
+        graph: graph object
         in_features: number of input features (per node)
         out_features: number of output features (per node)
         bias: whether to learn an edge-depenent bias
         self_loop: whether to include self loops in message passing
     """
-    def __init__(self, graph: torch.Tensor, in_features: int, out_features: int,
-                 bias: bool = True, self_loop: bool = True):
-        super(GraphConv, self).__init__()
+    def __init__(self, graph:Graph, in_features:int, out_features:int,
+                 bias:bool = True, self_loop:bool or int = True):
+        super(GraphConvLayer, self).__init__()
+        self.self_loop = self_loop
+        if isinstance(self.self_loop, bool):
+            if self.self_loop:
+                self.graph = graph.add_self_loops()
+            else:
+                self.graph = graph
+        else:
+            self.graph = graph.add_self_loops(start=self.self_loop)
         self.in_features = in_features
         self.out_features = out_features
-        if bias:
-            self.bias = bias
-        else:
-            self.register_parameter('bias', None)
-        self.edge_types = None
-        self.update_graph(graph)
-        self.self_loop = self_loop
-
-    def update_graph(self, graph):
-        # update the graph, adding new linear maps if needed
-        self.graph = graph
-        edge_types = graph[-1].max() + 1
-        if edge_types != self.edge_types:
-            self.weight = nn.Parameter(torch.Tensor(edge_types, self.out_features, self.in_features))
-            if self.bias is not None:
-                self.bias = nn.Parameter(torch.Tensor(edge_types, self.out_features))
-            self.reset_parameters()
-        self.edge_types = edge_types
-        return self
-
+        self.weight_graph = self.graph.expand(self.out_features, self.in_features)
+        self.weight_vector = nn.Parameter(torch.Tensor(self.weight_graph.max_edge_type))
+        self.bias = bias
+        if self.bias:
+            self.bias_graph = self.graph.expand(self.out_features, 1)
+            self.bias_vector = nn.Parameter(torch.Tensor(self.bias_graph.max_edge_type))        
+        self.reset_parameters()
+        (self.target_dim, self.source_dim) = self.weight_graph.dims
+    
     def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
+        bound = 1 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.weight_vector, -bound, bound)
+        if self.bias:
+            nn.init.uniform_(self.bias_vector, -bound, bound)
     
     def extra_repr(self):
-        return 'edge_types={}, in_features={}, out_features={}, bias={}, self_loop={}'.format(
-            self.edge_types, self.in_features, self.out_features, self.bias is not None, self.self_loop)
-
-    def forward(self, input, j = None):
-        # forward from a source node, indexed by j
-        # if j is None, forward all nodes
-        if j is None: # forward all nodes together
-            if self.self_loop: # if self loop allowed
-                typ0 = 0 # typ starts from 0
-            else: # if self loop forbidden
-                typ0 = 1 # typ starts from 1
-            output = None
-            for typ in range(typ0, self.edge_types):
-                mask = (self.graph[2] == typ)
-                if output is None:
-                    output = self.propagate_homo(self.graph[:2, mask], input, typ)
+        return 'in_features={}, out_features={}, bias={}, self_loop={}\n{}'.format(
+            self.in_features, self.out_features, self.bias, self.self_loop, self.graph)
+    
+    def forward(self, x, depth=None):
+        weight_matrix = self.weight_graph.sparse_matrix(self.weight_vector, depth)
+        y = torch.sparse.mm(weight_matrix, x)
+        if self.bias:
+            bias_matrix = self.bias_graph.sparse_matrix(self.bias_vector, depth)
+            unit = torch.ones((bias_matrix.shape[1], 1), dtype=bias_matrix.dtype, device=bias_matrix.device)
+            y = y + torch.sparse.mm(bias_matrix, unit)
+        return y
+    
+class GraphConvNet(nn.Module):
+    """ Graph Convolution network 
+        
+        Args:
+        graph: graph object
+        features: a list of numbers of features (per node) across layers
+        bias: whether to learn an edge-depenent bias
+        nonlinearity: nonlinear activation to use
+    """
+    def __init__(self, graph:Graph, features, bias:bool = True, nonlinearity:str = 'Tanh'):
+        super(GraphConvNet, self).__init__()
+        self.graph = graph
+        self.features = features
+        self.layers = nn.ModuleList()
+        for l in range(1, len(self.features)):
+            if l == 1: # the first layer should not have self loops
+                self.layers.append(GraphConvLayer(self.graph, self.features[0], self.features[1], bias, self_loop=False))
+            else: # remaining layers are normal
+                self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
+                self.layers.append(GraphConvLayer(self.graph, self.features[l - 1], self.features[l], bias, self_loop=1))
+                
+    def forward(self, input, depth=None, cache=None):
+        # input: [..., nodes, features]
+        in_shape = input.shape
+        batch_dim = torch.tensor(in_shape[:-2]).prod()
+        input_dim = torch.tensor(in_shape[-2:]).prod()
+        x = input.view((batch_dim, input_dim)).T
+        if depth is None:
+            for layer in self.layers:
+                x = layer(x)
+        else: # depth-specific forward
+            if cache is None: # if cache not exist, prepare cache
+                cache = [x]
+                for layer in self.layers:
+                    if isinstance(layer, GraphConvLayer):
+                        target_dim = layer.target_dim
+                    cache.append(torch.zeros((target_dim, batch_dim), device=x.device))
+            else: # if cache exist, load x to cache[0]
+                cache[0] = x
+            # cache is ready, start forwarding
+            for l, layer in enumerate(self.layers):
+                if isinstance(layer, GraphConvLayer):
+                    if l == 0: # first layer should forward from the previous depth
+                        cache[l+1] = cache[l+1] + layer(cache[l], depth - 1)
+                    else: # remaining layer forward from the current depth
+                        cache[l+1] = cache[l+1] + layer(cache[l], depth)
                 else:
-                    output += self.propagate_homo(self.graph[:2, mask], input, typ)
-        else: # forward from specific node
-            graph = self.graph
-            mask = (graph[0] == j) # mask out edges from other nodes
-            graph = graph[:, mask]
-            if not self.self_loop: # no self loop
-                mask = (graph[2] != 0) # mask out self loops
-                graph = graph[:, mask]
-            output = self.propagate_hetero(graph, input)
-        return output
-
-    def propagate_homo(self, graph, input, typ):
-        [source, target] = graph
-        signal = input[..., source, :] # shape [..., E, in_features]
-        if self.bias is None:
-            message = F.linear(signal, self.weight[typ]) # shape: [..., E, out_features]
+                    cache[l+1] = layer(cache[l])
+            x = cache[-1] # last cache hosts output
+        out_shape = in_shape[:-1]+(self.features[-1],)
+        output = x.T.view(out_shape)
+        if cache is None:
+            return output
         else:
-            message = F.linear(signal, self.weight[typ], self.bias[typ]) # shape: [..., E, out_features]
-        output = torch_scatter.scatter_add(message, target,
-                    dim = -2, dim_size = input.size(-2))
-        return output # shape: [..., N, out_features]
+            return output, cache
 
-    def propagate_hetero(self, graph, input):
-        # input: shape [..., N, in_features]
-        [source, target, edge_type] = graph
-        signal = input[..., source, :] # shape [..., E, in_features]
-        weight = self.weight[edge_type] # shape [E, out_features, in_features]
-        message = torch.sum(weight * signal.unsqueeze(-2), -1) # shape [..., E, out_features]
-        if self.bias is not None:
-            bias = self.bias[edge_type] # shape [E, out_features]
-            message += bias
-        output = torch_scatter.scatter_add(message, target,
-                    dim = -2, dim_size = input.size(-2))
-        return output # shape: [..., N, out_features]
+""" -------- Base Distribution -------- """
 
 class Autoregressive(nn.Module, dist.Distribution):
     """ Represent a generative model that can generate samples and evaluate log probabilities.
         
         Args:
-        lattice: lattice system
-        features: a list of feature dimensions for all layers
-        nonlinearity: activation function to use 
-        bias: whether to learn the bias
+        latt: Lattice
+        num_classes: number of classes = group order
+        hidden_features: a list of integers specifying hidden dimensions
+        bias, nonlinearity (optional): to set graph convolutional network
+        radius (optional): radius used to construct causal graph 
     """
     
-    def __init__(self, lattice: Lattice, features, nonlinearity: str = 'Tanh', bias: bool = True):
+    def __init__(self, lattice: Lattice, num_classes: int, hidden_features = [], 
+                 bias:bool = True, nonlinearity:str = 'Tanh', radius:float = 1.):
         super(Autoregressive, self).__init__()
         self.lattice = lattice
-        self.nodes = lattice.sites
-        self.features = features
-        dist.Distribution.__init__(self, event_shape=torch.Size([self.nodes, self.features[0]]))
-        self.has_rsample = True
-        self.graph = self.lattice.causal_graph()
-        self.layers = nn.ModuleList()
-        for l in range(1, len(self.features)):
-            if l == 1: # the first layer should not have self loops
-                self.layers.append(GraphConv(self.graph, self.features[0], self.features[1], bias, self_loop = False))
-            else: # remaining layers are normal
-                #self.layers.append(nn.LayerNorm([self.features[l - 1]]))
-                self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
-                self.layers.append(GraphConv(self.graph, self.features[l - 1], self.features[l], bias))
-
-    def update_graph(self, graph):
-        # update graph for all GraphConv layers
-        self.graph = graph
-        for layer in self.layers:
-            if isinstance(layer, GraphConv):
-                layer.update_graph(graph)
-        return self
-
-    def forward(self, input):
-        output = input
-        for layer in self.layers: # apply layers
-            output = layer(output)
-        return output # logits
+        self.graph = self.lattice.causal_graph(radius)
+        self.num_classes = num_classes
+        features = [self.num_classes] + hidden_features + [self.num_classes]
+        self.gcn = GraphConvNet(self.graph, features, bias, nonlinearity)
+        self.sampler = dist.OneHotCategorical
     
-    def log_prob(self, sample):
-        logits = self(sample) # forward pass to get logits
-        return torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
-
-    def sampler(self, logits, dim=-1): # simplified from F.gumbel_softmax
-        gumbels = -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        gumbels += logits.detach()
-        index = gumbels.max(dim, keepdim=True)[1]
-        return torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
-
-    def _sample(self, sample_size: int, sampler = None):
-        if sampler is None: # if no sampler specified, use default
-            sampler = self.sampler
-        # create a list of tensors to cache layer-wise outputs
-        cache = [torch.zeros(sample_size, self.nodes, self.features[0], device=device)]
-        for layer in self.layers:
-            if isinstance(layer, GraphConv): # for graph convolution layers
-                features = layer.out_features # features get updated
-            cache.append(torch.zeros(sample_size, self.nodes, features, device=device))
-        # cache established. start by sampling node 0.
-        # assuming global symmetry, node 0 is always sampled uniformly
-        cache[0][..., 0, :] = sampler(cache[0][..., 0, :])
-        # start autoregressive sampling
-        for j in range(1, self.nodes): # iterate through nodes 1:all
-            for l, layer in enumerate(self.layers):
-                if isinstance(layer, GraphConv): # for graph convolution layers
-                    if l==0: # first layer should forward from previous node
-                        cache[l + 1] += layer(cache[l], j - 1)
-                    else: # remaining layers forward from this node
-                        cache[l + 1] += layer(cache[l], j)
-                else: # for other layers, only update node j (other nodes not ready yet)
-                    src = layer(cache[l][..., [j], :])
-                    index = src.new_full(src.size(), j, dtype=torch.long)
-                    cache[l + 1] = cache[l + 1].scatter(-2, index, src)
-            # the last cache hosts the logit, sample from it 
-            cache[0][..., j, :] = sampler(cache[-1][..., j, :])
-        return cache # cache[0] hosts the sample
+    def sample(self, sample_size: int):
+        device = next(self.parameters()).device # determine device
+        samples = torch.zeros(sample_size, self.lattice.sites, self.num_classes, device=device) # prepare sample container
+        cache = None
+        for depth in range(self.graph.max_depth + 1):
+            logits, cache = self.gcn(samples, depth, cache)
+            select = self.graph.source_depths == depth # select nodes of the depth
+            # sample from logits (!this in-place operation stops gradient backprop)
+            samples[...,select,:] = self.sampler(logits=logits[...,select,:]).sample()
+        return samples
     
-    def sample(self, sample_size=1):
-        with torch.no_grad():
-            cache = self._sample(sample_size)
-        return cache[0]
-    
-    def rsample(self, sample_size=1, tau=None, hard=False):
-        # reparametrized Gumbel sampling
-        if tau is None: # if temperature not given
-            tau = 1/(self.features[-1]-1) # set by the out feature dimension
-        cache = self._sample(sample_size, lambda x: F.gumbel_softmax(x, tau, hard))
-        return cache[0]
-
-    def sample_with_log_prob(self, sample_size=1):
-        cache = self._sample(sample_size)
-        sample = cache[0]
-        logits = cache[-1]
-        log_prob = torch.sum(sample * F.log_softmax(logits, dim=-1), (-2,-1))
-        return sample, log_prob
-
+    def log_prob(self, samples):
+        logits = self.gcn(samples) # forward pass to get logits
+        log_prob = torch.sum(samples * F.log_softmax(logits, dim=-1), (-2,-1))
+        return log_prob
 
 """ -------- Model Interface -------- """
 
-class HolographicPixelGNN(nn.Module, dist.TransformedDistribution):
+class HolographicPixelGNN(nn.Module):
     """ Combination of hierarchical autoregressive and flow-based model for lattice models.
     
         Args:
         model: a energy model to learn
-        hidden_features: a list of feature dimensions of hidden layers
-        nonlinearity: activation function to use 
-        bias: whether to learn the additive bias in heap linear layers
+        hidden_features, bias, nonlinearity, radius: arguments for Autoregressive
     """
-    def __init__(self, model: Model, hidden_features, nonlinearity: str = 'Tanh', bias: bool = True):
+    def __init__(self, model: Model, *args, **kwargs):
         super(HolographicPixelGNN, self).__init__()
         self.model = model
-        self.energy = model.energy
-        self.group = model.group
-        self.lattice = model.lattice
-        self.haar = HaarTransform(self.group, self.lattice)
-        self.onecat = OneHotCategoricalTransform(self.group.order)
-        features = [self.group.order] + hidden_features + [self.group.order]
-        auto = Autoregressive(self.lattice, features, nonlinearity, bias)
-        dist.TransformedDistribution.__init__(self, auto, [self.onecat, self.haar])
-        self.transform = dist.ComposeTransform(self.transforms)
-
-
-    def free_energy(self, x):
-        dims = tuple(range(-self.lattice.dimension,0))
-        translation = itertools.product(*([range(self.lattice.size)]*self.lattice.dimension))
-        log_probs = torch.stack([self.log_prob(x.roll(shifts=shifts, dims=dims)) for shifts in translation])
-        log_prob = log_probs.logsumexp(0) - math.log(self.lattice.sites)
-        return self.energy(x) + log_prob
-
-
-
-
-
+        self.haar = HaarTransform(self.model.lattice, self.model.group)
+        self.cate = OneHotCategoricalTransform(self.model.group.order)
+        self.transform = dist.ComposeTransform([self.cate, self.haar])
+        self.generator = Autoregressive(self.model.lattice, self.model.group.order, *args, **kwargs)
+        
+    def sample(self, sample_size: int):
+        with torch.no_grad(): # disable gradient to save memory
+            z = self.generator.sample(sample_size) 
+        return self.transform(z)
+    
+    def log_prob(self, x):
+        z = self.transform.inv(x)
+        return self.generator.log_prob(z)
+    
+    def energy(self, x):
+        return self.model(x)
+    
+    def loss(self, sample_size:int, return_statistics:bool = False):
+        with torch.no_grad(): # disable gradient to save memory
+            z = self.generator.sample(sample_size)
+        energy = self.model(self.transform(z))
+        log_prob = self.generator.log_prob(z)
+        free = energy + log_prob.detach()
+        meanfree = free.mean()
+        loss = torch.mean(log_prob * (free - meanfree))
+        if return_statistics:
+            stdfree = free.std()
+            return loss, meanfree.item(), stdfree.item()
+        else:
+            return loss
 
 
 
