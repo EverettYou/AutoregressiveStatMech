@@ -11,7 +11,8 @@ if torch.cuda.is_available():
 else:
     device = torch.device('cpu')
 
-""" -------- Infrastructures -------- """
+""" -------- Graph -------- """
+
 class Graph(object):
     """ Host graph information and enables graph expansion
         
@@ -28,7 +29,10 @@ class Graph(object):
             self.dims = dims
         self.indices = indices
         self.edge_types = edge_types
-        self.max_edge_type = edge_types.max().item()
+        if len(self.edge_types) == 0:
+            self.max_edge_type = 0
+        else:
+            self.max_edge_type = edge_types.max().item()
         if source_depths is None:
             self.source_depths = self.get_depth_assignment()
         else:
@@ -98,6 +102,8 @@ class Graph(object):
             edge_types = self.edge_types[select]
         return torch.sparse_coo_tensor(indices, vector[edge_types-1], self.dims)
 
+""" -------- Lattice -------- """
+
 class Node(object):
     """ Represent a node object, containing coordinate and relationship information.
     """
@@ -136,21 +142,81 @@ class Node(object):
             return self.children[-1].shadow_sites()
         elif self.type is 'phy':
             return []
-    
+
 class Lattice(object):
-    """ Hosts lattice information and construct causal graph
+    """ Host lattice information and construct causal graph
         
         Args:
         size: number of size along one dimension (assuming square/cubical lattice)
-              must be a power of 2 for binary tree construction
         dimension: dimension of the lattice
     """
     def __init__(self, size:int, dimension:int):
-        assert (size & (size-1) == 0) and size != 0, "size must be a power of 2."
-        assert dimension > 0, "dimension must be a positive integer."
+        assert size > 0, "lattice size must be a positive integer."
+        assert dimension > 0, "lattice dimension must be a positive integer."
         self.size = size
         self.dimension = dimension
         self.sites = size**dimension
+        self.nodes = []
+
+    def __repr__(self):
+        return 'Lattice({} grid)'.format('x'.join(str(self.size) for k in range(self.dimension)))
+
+    def relevant_nodes(self, node, **kwargs):
+        raise NotImplementedError
+
+    def relationship(self, node1, node2, **kwargs):
+        raise NotImplementedError
+
+    def causal_graph(self, **kwargs):
+        relations = set()
+        edges = {}
+        for target_node in self.nodes[1:]:
+            if target_node.type is 'lat':
+                for source_node in self.relevant_nodes(target_node, **kwargs):
+                    relation = self.relationship(source_node, target_node, **kwargs)
+                    relations.add(relation)
+                    edges[(target_node.ind, source_node.ind)] = relation
+        relations = list(relations)
+        type_map = {relation: k+1 for k, relation in enumerate(relations)}
+        indices = torch.zeros((2, len(edges)), dtype = torch.long)
+        edge_types = torch.zeros(len(edges), dtype = torch.long)
+        for k, (edge, relation) in enumerate(edges.items()):
+            indices[0, k] = edge[0]
+            indices[1, k] = edge[1]
+            edge_types[k] = type_map[relation]
+        graph = Graph(self.sites, indices, edge_types)
+        graph.type_dict = {edge_type: relation for relation, edge_type in type_map.items()}
+        return graph
+
+class FlatLattice(Lattice):
+    """ Flat lattice (regular grid in flat space) """
+    def __init__(self, size:int, dimension:int):
+        super(FlatLattice, self).__init__(size, dimension)
+        self.nodes = [Node(i) for i in range(self.sites)]
+        for i, center in enumerate(itertools.product(range(self.size), repeat=self.dimension)):
+            self.nodes[i].type = 'lat'
+            self.nodes[i].center = torch.tensor(center).float()
+            
+    def relevant_nodes(self, node, radius=2., **kwargs):
+        relevant_nodes = set()
+        for prior_node in self.nodes[:node.ind]:
+            displacement = prior_node.center - node.center
+            displacement = (displacement + self.size/2)%self.size - self.size/2
+            if displacement.norm() < radius:
+                relevant_nodes.add(prior_node)
+        return relevant_nodes
+    
+    def relationship(self, node1, node2, **kwargs):
+        displacement = node1.center - node2.center
+        displacement = (displacement + self.size/2)%self.size - self.size/2
+        symmetrized, _ = displacement.abs().sort()
+        return tuple(symmetrized.long().tolist())
+  
+class TreeLattice(Lattice):
+    """ Tree lattice (binary H-tree, latent nodes + physical nodes) """
+    def __init__(self, size:int, dimension:int):
+        assert (size & (size-1) == 0), "lattice size must be a power of 2 for TreeLattice."
+        super(TreeLattice, self).__init__(size, dimension)
         self.nodes = [Node(i) for i in range(2*self.sites)]
         self.nodes[0].type = 'lat'
         self.nodes[0].generation = 0
@@ -178,10 +244,7 @@ class Lattice(object):
                 this_node.type = 'phy'
                 this_node.site = rng[:,0].dot(self.size**torch.arange(0,self.dimension).flip(0)).item()
         partition(torch.tensor([[0, self.size]]*self.dimension), 0, 1, 0)
-        
-    def __repr__(self):
-        return 'Lattice({} grid)'.format('x'.join(str(self.size) for k in range(self.dimension)))
-    
+            
     def wavelet_maps(self):
         decoder_map = torch.zeros((self.sites,self.sites), dtype=torch.long)
         for node in self.nodes:
@@ -192,7 +255,7 @@ class Lattice(object):
         encoder_map = torch.inverse(decoder_map.double()).round().long()
         return encoder_map, decoder_map
                     
-    def relevant_nodes(self, node, radius = 1.):
+    def relevant_nodes(self, node, radius = 1., **kwargs):
         # relevant_nodes = union of ancestors of adjacent nodes within given radius
         scaled_radius = radius * self.size / 2**(node.generation/self.dimension)
         relevant_nodes = set()
@@ -219,32 +282,12 @@ class Lattice(object):
                 node1 = node1.parent
         return common_ancestor
     
-    def relationship(self, node1, node2):
+    def relationship(self, node1, node2, **kwargs):
         common_ancestor = self.common_ancestor(node1, node2)
         return (node1.generation - common_ancestor.generation, node2.generation - common_ancestor.generation)
-    
-    def causal_graph(self, radius = 1.):
-        relations = set()
-        edges = {}
-        for target_node in self.nodes[1:]:
-            if target_node.type is 'lat':
-                for source_node in self.relevant_nodes(target_node, radius):
-                    relation = self.relationship(source_node, target_node)
-                    relations.add(relation)
-                    edges[(target_node.ind, source_node.ind)] = relation
-        relations = list(relations)
-        relations.sort()
-        type_map = {relation: k+1 for k, relation in enumerate(relations)}
-        indices = torch.zeros((2, len(edges)), dtype = torch.long)
-        edge_types = torch.zeros(len(edges), dtype = torch.long)
-        for k, (edge, relation) in enumerate(edges.items()):
-            indices[0, k] = edge[0]
-            indices[1, k] = edge[1]
-            edge_types[k] = type_map[relation]
-        graph = Graph(self.sites, indices, edge_types)
-        graph.type_dict = {edge_type: relation for relation, edge_type in type_map.items()}
-        return graph
-    
+
+""" -------- Group -------- """
+
 class Group(nn.Module):
     """Represent a group, providing multiplication and inverse operation.
     
@@ -314,7 +357,6 @@ class SymmetricGroup(Group):
                 return cycle_number(tuple(g[0] - 1 if a == 0 else a - 1 for a in g[1:]))
         val_table = torch.tensor([cycle_number(g) for g in self.elements], dtype=torch.float)
         return val_table
-
 
 """ -------- Energy Model -------- """
 
@@ -446,13 +488,30 @@ class Model(nn.Module):
 
 """ -------- Transformations -------- """
 
+class ReshapeTransform(dist.Transform):
+    """ Arrange flatten variables on the lattice and vice versa
+
+        Args:
+        lattice: a flat lattice system
+    """
+    def __init__(self, lattice: Lattice):
+        super(ReshapeTransform, self).__init__()
+        self.lattice = lattice
+        self.bijective = True
+
+    def _call(self, z):
+        return z.view(z.shape[:-1]+(self.lattice.size,)*self.lattice.dimension)
+
+    def _inverse(self, x):
+        return x.flatten(-self.lattice.dimension)
+
 class HaarTransform(dist.Transform):
     """ Haar wavelet transformation (bijective)
         transformation takes real space configurations x to wavelet space encoding y
     
         Args:
-        group: a group structure for each unit
-        lattice: a lattice system containing information of the group and lattice shape
+        lattice: a tree lattice system
+        group: a group structure for each variable
     """
     def __init__(self, lattice: Lattice, group: Group):
         super(HaarTransform, self).__init__()
@@ -502,11 +561,16 @@ class GraphConvLayer(nn.Module):
         graph: graph object
         in_features: number of input features (per node)
         out_features: number of output features (per node)
-        bias: whether to learn an edge-depenent bias
-        self_loop: whether to include self loops in message passing
+        bias: (optional) whether to learn an edge-depenent bias
+        self_loop: (optional) whether to include self loops in message passing
     """
-    def __init__(self, graph:Graph, in_features:int, out_features:int,
-                 bias:bool = True, self_loop:bool or int = True):
+    def __init__(self, 
+                 graph:Graph,
+                 in_features:int,
+                 out_features:int,
+                 bias:bool = True,
+                 self_loop:bool or int = True, 
+                 **kwargs):
         super(GraphConvLayer, self).__init__()
         self.self_loop = self_loop
         if isinstance(self.self_loop, bool):
@@ -552,20 +616,23 @@ class GraphConvNet(nn.Module):
         Args:
         graph: graph object
         features: a list of numbers of features (per node) across layers
-        bias: whether to learn an edge-depenent bias
-        nonlinearity: nonlinear activation to use
+        nonlinearity: (optional) nonlinear activation to use
     """
-    def __init__(self, graph:Graph, features, bias:bool = True, nonlinearity:str = 'ReLU'):
+    def __init__(self, 
+                 graph:Graph, 
+                 features, 
+                 nonlinearity:str = 'ReLU', 
+                 **kwargs):
         super(GraphConvNet, self).__init__()
         self.graph = graph
         self.features = features
         self.layers = nn.ModuleList()
         for l in range(1, len(self.features)):
             if l == 1: # the first layer should not have self loops
-                self.layers.append(GraphConvLayer(self.graph, self.features[0], self.features[1], bias, self_loop=False))
+                self.layers.append(GraphConvLayer(self.graph, self.features[0], self.features[1], self_loop=False, **kwargs))
             else: # remaining layers are normal
                 self.layers.append(getattr(nn, nonlinearity)()) # activatioin layer
-                self.layers.append(GraphConvLayer(self.graph, self.features[l - 1], self.features[l], bias, self_loop=1))
+                self.layers.append(GraphConvLayer(self.graph, self.features[l - 1], self.features[l], self_loop=1, **kwargs))
                 
     def forward(self, input, depth=None, cache=None):
         # input: [..., nodes, features]
@@ -610,19 +677,20 @@ class Autoregressive(nn.Module, dist.Distribution):
         Args:
         latt: Lattice
         num_classes: number of classes = group order
-        hidden_features: a list of integers specifying hidden dimensions
-        bias, nonlinearity (optional): to set graph convolutional network
-        radius (optional): radius used to construct causal graph 
+        hidden_features: (optional) a list of integers specifying hidden dimensions
     """
     
-    def __init__(self, lattice: Lattice, num_classes: int, hidden_features = [], 
-                 bias:bool = True, nonlinearity:str = 'Tanh', radius:float = 1.):
+    def __init__(self, 
+                 lattice: Lattice, 
+                 num_classes: int, 
+                 hidden_features = [],
+                 **kwargs):
         super(Autoregressive, self).__init__()
         self.lattice = lattice
-        self.graph = self.lattice.causal_graph(radius)
+        self.graph = self.lattice.causal_graph(**kwargs)
         self.num_classes = num_classes
         features = [self.num_classes] + hidden_features + [self.num_classes]
-        self.gcn = GraphConvNet(self.graph, features, bias, nonlinearity)
+        self.gcn = GraphConvNet(self.graph, features, **kwargs)
         self.sampler = dist.OneHotCategorical
     
     def sample(self, sample_size: int):
@@ -643,21 +711,26 @@ class Autoregressive(nn.Module, dist.Distribution):
 
 """ -------- Model Interface -------- """
 
-class HolographicPixelGNN(nn.Module):
-    """ Combination of hierarchical autoregressive and flow-based model for lattice models.
+class PixelGNN(nn.Module):
+    """ Autoregressive model based on Graph Neural Network
     
         Args:
         model: a energy model to learn
-        hidden_features, bias, nonlinearity, radius: arguments for Autoregressive
     """
-    def __init__(self, model: Model, *args, **kwargs):
-        super(HolographicPixelGNN, self).__init__()
+    def __init__(self, model: Model, **kwargs):
+        super(PixelGNN, self).__init__()
         self.model = model
-        self.haar = HaarTransform(self.model.lattice, self.model.group)
-        self.cate = OneHotCategoricalTransform(self.model.group.order)
-        self.transform = dist.ComposeTransform([self.cate, self.haar])
-        self.generator = Autoregressive(self.model.lattice, self.model.group.order, *args, **kwargs)
-        
+        self.generator = Autoregressive(self.model.lattice, self.model.group.order, **kwargs)
+        if isinstance(self.model.lattice, FlatLattice):
+            self.configrate = ReshapeTransform(self.model.lattice)
+        else:
+            self.configrate = HaarTransform(self.model.lattice, self.model.group)
+        self.categorize = OneHotCategoricalTransform(self.model.group.order)
+        self.transform = dist.ComposeTransform([self.categorize, self.configrate])
+    
+    def extra_repr(self):
+        return '(transform): {}'.format(self.transform)
+
     def sample(self, sample_size: int):
         with torch.no_grad(): # disable gradient to save memory
             z = self.generator.sample(sample_size) 
