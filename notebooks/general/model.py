@@ -187,6 +187,19 @@ class Lattice(object):
         graph = Graph(self.sites, indices, edge_types)
         graph.type_dict = {edge_type: relation for relation, edge_type in type_map.items()}
         return graph
+    
+    def randperm(self, sample_size):
+        grid = torch.tensor(list(itertools.product(range(self.size), repeat=self.dimension)))
+        new_grids = []
+        for _ in range(sample_size):
+            new_grid = grid[:,torch.randperm(self.dimension)]
+            new_grid *= (-1)**torch.randint(2, (1,self.dimension))
+            new_grid += torch.randint(self.size, (1, self.dimension))
+            new_grid = new_grid % self.size
+            new_grids.append(new_grid)
+        base = self.size**torch.arange(self.dimension).flip(0)
+        perms = torch.tensordot(torch.stack(new_grids), base, dims=1)
+        return perms
 
 class FlatLattice(Lattice):
     """ Flat lattice (regular grid in flat space) """
@@ -211,7 +224,7 @@ class FlatLattice(Lattice):
         displacement = (displacement + self.size/2)%self.size - self.size/2
         symmetrized, _ = displacement.abs().sort()
         return tuple(symmetrized.long().tolist())
-  
+    
 class TreeLattice(Lattice):
     """ Tree lattice (binary H-tree, latent nodes + physical nodes) """
     def __init__(self, size:int, dimension:int):
@@ -282,9 +295,13 @@ class TreeLattice(Lattice):
                 node1 = node1.parent
         return common_ancestor
     
-    def relationship(self, node1, node2, **kwargs):
-        common_ancestor = self.common_ancestor(node1, node2)
-        return (node1.generation - common_ancestor.generation, node2.generation - common_ancestor.generation)
+    def relationship(self, node1, node2, scale_invariance=True, **kwargs):
+        gen1, gen2 = node1.generation, node2.generation
+        gen0 = self.common_ancestor(node1, node2).generation
+        if scale_invariance:
+            return (gen1 - gen0, gen2 - gen0)
+        else:
+            return (gen0, gen1 - gen0, gen2 - gen0)
 
 """ -------- Group -------- """
 
@@ -499,8 +516,8 @@ class ReshapeTransform(dist.Transform):
         self.lattice = lattice
         self.bijective = True
 
-    def _call(self, z):
-        return z.view(z.shape[:-1]+(self.lattice.size,)*self.lattice.dimension)
+    def _call(self, x):
+        return x.view(x.shape[:-1]+(self.lattice.size,)*self.lattice.dimension)
 
     def _inverse(self, x):
         return x.flatten(-self.lattice.dimension)
@@ -547,7 +564,7 @@ class OneHotCategoricalTransform(dist.Transform):
     
     def _inverse(self, y):
         # categorical to one-hot
-        return F.one_hot(y, self.num_classes).to(dtype=torch.float)
+        return F.one_hot(y, self.num_classes).float()
     
     def log_abs_det_jacobian(self, x, y):
         return torch.tensor(0.)
@@ -723,8 +740,10 @@ class PixelGNN(nn.Module):
         self.generator = Autoregressive(self.model.lattice, self.model.group.order, **kwargs)
         if isinstance(self.model.lattice, FlatLattice):
             self.configrate = ReshapeTransform(self.model.lattice)
-        else:
+        elif isinstance(self.model.lattice, TreeLattice):
             self.configrate = HaarTransform(self.model.lattice, self.model.group)
+        else:
+            raise NotImplementedError
         self.categorize = OneHotCategoricalTransform(self.model.group.order)
         self.transform = dist.ComposeTransform([self.categorize, self.configrate])
     
@@ -734,20 +753,39 @@ class PixelGNN(nn.Module):
     def sample(self, sample_size: int):
         with torch.no_grad(): # disable gradient to save memory
             z = self.generator.sample(sample_size) 
-        return self.transform(z)
+            x = self.transform(z)
+        return x
+    
+    def energy(self, x):
+        return self.model(x)
     
     def log_prob(self, x):
         z = self.transform.inv(x)
         return self.generator.log_prob(z)
     
-    def energy(self, x):
-        return self.model(x)
+    def randmix(self, x, mixtures: int):
+        x = x.flatten(-self.model.lattice.dimension)
+        xs = x[:,self.model.lattice.randperm(mixtures)]
+        shape = xs.shape[:-1]+(self.model.lattice.size,)*self.model.lattice.dimension
+        return xs.view(shape)
     
-    def loss(self, sample_size:int, return_statistics:bool = False):
-        with torch.no_grad(): # disable gradient to save memory
-            z = self.generator.sample(sample_size)
-        energy = self.model(self.transform(z))
-        log_prob = self.generator.log_prob(z)
+    def log_mixed_prob(self, x, mixtures: int):
+        xs = self.randmix(x, mixtures)
+        log_probs = self.log_prob(xs)
+        leading = torch.logsumexp(log_probs, -1) - math.log(mixtures)
+        qs = torch.exp(log_probs - log_probs.mean(-1, keepdim=True))
+        subleading = qs.var(-1) / qs.mean(-1)**2 
+        return leading + subleading / (2 * mixtures)
+    
+    def loss(self, sample_size: int,
+             mixtures: int = None,
+             return_statistics: bool = False):
+        x = self.sample(sample_size)
+        energy = self.energy(x)
+        if mixtures is None:
+            log_prob = self.log_prob(x)
+        else:
+            log_prob = self.log_mixed_prob(x, mixtures)
         free = energy + log_prob.detach()
         meanfree = free.mean()
         loss = torch.mean(log_prob * (free - meanfree))
@@ -756,10 +794,6 @@ class PixelGNN(nn.Module):
             return loss, meanfree.item(), stdfree.item()
         else:
             return loss
-
-
-
-
 
 
 
