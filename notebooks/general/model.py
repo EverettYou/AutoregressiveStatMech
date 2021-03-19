@@ -739,13 +739,13 @@ class PixelGNN(nn.Module):
         self.model = model
         self.generator = Autoregressive(self.model.lattice, self.model.group.order, **kwargs)
         if isinstance(self.model.lattice, FlatLattice):
-            self.configrate = ReshapeTransform(self.model.lattice)
+            self.configurate = ReshapeTransform(self.model.lattice)
         elif isinstance(self.model.lattice, TreeLattice):
-            self.configrate = HaarTransform(self.model.lattice, self.model.group)
+            self.configurate = HaarTransform(self.model.lattice, self.model.group)
         else:
             raise NotImplementedError
         self.categorize = OneHotCategoricalTransform(self.model.group.order)
-        self.transform = dist.ComposeTransform([self.categorize, self.configrate])
+        self.transform = dist.ComposeTransform([self.categorize, self.configurate])
     
     def extra_repr(self):
         return '(transform): {}'.format(self.transform)
@@ -773,7 +773,8 @@ class PixelGNN(nn.Module):
         xs = self.randmix(x, mixtures)
         log_probs = self.log_prob(xs)
         leading = torch.logsumexp(log_probs, -1) - math.log(mixtures)
-        qs = torch.exp(log_probs - log_probs.mean(-1, keepdim=True))
+        max_log_prob, _ = log_probs.max(-1, keepdim=True)
+        qs = torch.exp(log_probs - max_log_prob) # subtract max logit to avoid overflow
         subleading = qs.var(-1) / qs.mean(-1)**2 
         return leading + subleading / (2 * mixtures)
     
